@@ -55,8 +55,9 @@ pub async fn delete_disk_session(
     .map_err(|e| format!("delete join: {e}"))?
 }
 
+// 同步 command 会在主线程执行；这些都做 `st.save()` 写盘，必须 async。
 #[tauri::command]
-pub fn rename_session(
+pub async fn rename_session(
     state: State<'_, AppState>,
     session_id: String,
     title: String,
@@ -77,7 +78,7 @@ pub fn rename_session(
 }
 
 #[tauri::command]
-pub fn remove_session_meta(
+pub async fn remove_session_meta(
     state: State<'_, AppState>,
     session_id: String,
 ) -> Result<DesktopState, String> {
@@ -90,7 +91,7 @@ pub fn remove_session_meta(
 /// Remove project-list meta entries that look like empty / placeholder sessions
 /// (uuid-only titles, "新会话", missing real title). Does not touch disk history.
 #[tauri::command]
-pub fn purge_stale_session_meta(
+pub async fn purge_stale_session_meta(
     state: State<'_, AppState>,
     project_id: Option<String>,
 ) -> Result<DesktopState, String> {

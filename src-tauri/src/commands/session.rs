@@ -131,6 +131,20 @@ pub async fn handle_server_request(
     Ok(())
 }
 
+/// 项目切换钩子：休眠其他项目里空闲/出错的会话，回收其 grok 进程。
+/// 运行中 / 等待授权的会话不动。返回回收数量。
+#[tauri::command]
+pub async fn set_active_project(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    project_id: String,
+) -> Result<usize, String> {
+    Ok(state
+        .supervisor
+        .hibernate_other_projects_idle(app, &project_id)
+        .await)
+}
+
 #[tauri::command]
 pub async fn hibernate_session(
     app: AppHandle,

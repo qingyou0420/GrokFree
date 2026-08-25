@@ -157,6 +157,7 @@ pub fn run() {
             commands::session::respond_permission,
             commands::session::handle_server_request,
             commands::session::hibernate_session,
+            commands::session::set_active_project,
             commands::open_config_file,
             commands::open_path,
             commands::open_in_editor,

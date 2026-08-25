@@ -1,4 +1,4 @@
-import { useCallback, useState, type Dispatch, type MutableRefObject, type SetStateAction } from "react";
+import { useCallback, useRef, useState, type Dispatch, type MutableRefObject, type SetStateAction } from "react";
 import { api, errorText } from "../lib/api";
 import { isPlaceholderTitle } from "../lib/acp-parse";
 import type {
@@ -112,11 +112,19 @@ export function useSessionActions(opts: {
     }
   }, [prefsRef, setState, setActiveProjectId, flash]);
 
+  /** 同项目并发新建守卫：双击/连点不再各起一个 grok agent（后端也有守卫，
+   * 这里提前拦截避免多余的错误 toast） */
+  const createInFlightRef = useRef<Set<string>>(new Set());
+
   const createSession = useCallback(
     async (project?: Project | null, agentId?: string | null) => {
       const proj = project ?? activeProject;
       if (!proj) {
         flash("请先选择或添加一个项目", "error");
+        return;
+      }
+      if (createInFlightRef.current.has(proj.id)) {
+        flash("会话正在启动，请稍候…", "info");
         return;
       }
       const useAgentId = agentId ?? "grok";
@@ -133,6 +141,7 @@ export function useSessionActions(opts: {
           return;
         }
       }
+      createInFlightRef.current.add(proj.id);
       setBusy(true);
       setShowDashboard(false);
       beginAtBottom();
@@ -166,6 +175,7 @@ export function useSessionActions(opts: {
         console.error("createSession failed", e);
         flash(`启动失败：${msg}`, "error");
       } finally {
+        createInFlightRef.current.delete(proj.id);
         setBusy(false);
       }
     },

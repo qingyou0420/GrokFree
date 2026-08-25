@@ -60,17 +60,22 @@ export function useAgentEvents(opts: {
         return;
       }
       unsubs.push(
+        // 后端把流式通知按 ~40ms 窗口合批（agent://streamBatch）：
+        // 逐 token 逐条 emit 会打满 Windows 主线程事件泵（窗口拖不动）。
         await api.on<{
           sessionId: string;
-          method: string;
-          params: Record<string, unknown>;
-        }>("agent://stream", (p) => {
+          events: Array<{ method: string; params: Record<string, unknown> }>;
+        }>("agent://streamBatch", (p) => {
+          if (!p.events?.length) return;
           setTranscripts((prev) => {
             const cur = prev[p.sessionId] ?? [];
             const showRaw = prefsRef.current.showRawAcpEvents === true;
-            const next = applyStream(cur, p.method, p.params || {}, {
-              showRawAcpEvents: showRaw,
-            });
+            let next = cur;
+            for (const ev of p.events) {
+              next = applyStream(next, ev.method, ev.params || {}, {
+                showRawAcpEvents: showRaw,
+              });
+            }
             // 静默事件 / 无变化：保持原引用，跳过整个 map 更新与重渲染
             if (next === cur) return prev;
             return { ...prev, [p.sessionId]: next };
@@ -93,6 +98,11 @@ export function useAgentEvents(opts: {
             setLive((prev) => {
               const id = (p as LiveSession).id;
               if (!id) return prev;
+              // 休眠 = 进程已回收：从活跃列表移除（切项目自动回收也走这里），
+              // 否则带 cwd 的 hibernated 事件会把幽灵会话塞回列表
+              if ((p as LiveSession).status === "hibernated") {
+                return prev.filter((s) => s.id !== id);
+              }
               const idx = prev.findIndex((s) => s.id === id);
               if (idx >= 0) {
                 const next = [...prev];

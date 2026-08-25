@@ -225,7 +225,7 @@ pub fn probe_environment(prefs: &DesktopPrefs) -> GrokEnvironment {
         || which_on_path(grok_path.file_name().and_then(|s| s.to_str()).unwrap_or("grok"));
 
     let version = if grok_exists {
-        run_version(&grok_path)
+        probe_grok_version_cached(&grok_path)
     } else {
         None
     };
@@ -283,12 +283,47 @@ fn auth_looks_valid(path: &PathBuf) -> bool {
     }
 }
 
+/// Hard deadline for `grok --version`. The CLI has been observed to hang on
+/// startup (network update check / AV scan); without a deadline every session
+/// spawn that probes the version leaks one hung `grok` process and never
+/// returns to the caller.
+const VERSION_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const WHICH_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+const VERSION_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[allow(clippy::type_complexity)]
+static VERSION_CACHE: std::sync::Mutex<
+    Option<(PathBuf, std::time::Instant, Option<String>)>,
+> = std::sync::Mutex::new(None);
+
+/// Cached `grok --version` (60s TTL). Every session spawn gates on the CLI
+/// version; re-spawning the probe per session multiplied processes during
+/// spawn storms. Cache is invalidated on prefs save (grok path may change).
+pub fn probe_grok_version_cached(exe: &std::path::Path) -> Option<String> {
+    {
+        let cache = VERSION_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((path, at, ver)) = cache.as_ref() {
+            if path == exe && at.elapsed() < VERSION_CACHE_TTL {
+                return ver.clone();
+            }
+        }
+    }
+    let ver = run_version(&exe.to_path_buf());
+    let mut cache = VERSION_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    *cache = Some((exe.to_path_buf(), std::time::Instant::now(), ver.clone()));
+    ver
+}
+
+pub fn invalidate_version_cache() {
+    let mut cache = VERSION_CACHE.lock().unwrap_or_else(|p| p.into_inner());
+    *cache = None;
+}
+
 fn run_version(exe: &PathBuf) -> Option<String> {
-    let out = crate::process_util::silent_command(exe)
-        .arg("--version")
-        .env("GROK_HOME", crate::paths::grok_home())
-        .output()
-        .ok()?;
+    let mut cmd = crate::process_util::silent_command(exe);
+    cmd.arg("--version")
+        .env("GROK_HOME", crate::paths::grok_home());
+    let out = crate::process_util::output_with_timeout(cmd, VERSION_PROBE_TIMEOUT)?;
     if !out.status.success() {
         return None;
     }
@@ -296,9 +331,13 @@ fn run_version(exe: &PathBuf) -> Option<String> {
 }
 
 fn which_on_path(name: &str) -> bool {
-    crate::process_util::silent_command(if cfg!(windows) { "where" } else { "which" })
-        .arg(name)
-        .output()
+    let mut cmd = crate::process_util::silent_command(if cfg!(windows) {
+        "where"
+    } else {
+        "which"
+    });
+    cmd.arg(name);
+    crate::process_util::output_with_timeout(cmd, WHICH_PROBE_TIMEOUT)
         .map(|o| o.status.success())
         .unwrap_or(false)
 }

@@ -1,4 +1,4 @@
-import { useCallback, useState, type Dispatch, type SetStateAction } from "react";
+import { useCallback, useState } from "react";
 import { api } from "../lib/api";
 import { useSessionStore } from "../state";
 
@@ -14,21 +14,34 @@ function uid(p: string) {
 
 /**
  * 输入框状态 + 发送（乐观上屏 user 块，失败补 system 错误块）。
+ *
+ * 发送**不再持有全局 busy**：一轮对话可能跑几分钟，全局 busy 会把
+ * 侧栏「新建/恢复」、项目切换全部锁死（看起来就是"切项目卡死"）。
+ * 忙碌状态改为按会话（status running / waiting_permission）门禁。
  */
 export function useComposerActions(opts: {
-  setBusy: Dispatch<SetStateAction<boolean>>;
   stickToBottom: () => void;
   scrollToBottom: (force?: boolean) => void;
   flash: Flash;
 }) {
-  const { setBusy, stickToBottom, scrollToBottom, flash } = opts;
+  const { stickToBottom, scrollToBottom, flash } = opts;
   const [input, setInput] = useState("");
   const setTranscripts = useSessionStore((s) => s.setTranscripts);
 
   const sendPrompt = useCallback(async () => {
     const text = input.trim();
-    const activeSessionId = useSessionStore.getState().activeSessionId;
+    const { activeSessionId, live } = useSessionStore.getState();
     if (!text || !activeSessionId) return;
+    // 按会话门禁：本会话在忙才拦，不影响其他会话/项目的操作
+    const cur = live.find((s) => s.id === activeSessionId);
+    if (cur && cur.status === "running") {
+      flash("本会话正在执行，请等待完成或点「停止」", "info", activeSessionId);
+      return;
+    }
+    if (cur && cur.status === "waiting_permission") {
+      flash("请先处理本会话的授权请求", "info", activeSessionId);
+      return;
+    }
     setInput("");
     stickToBottom();
     setTranscripts((prev) => ({
@@ -39,7 +52,6 @@ export function useComposerActions(opts: {
       ],
     }));
     scrollToBottom(true);
-    setBusy(true);
     try {
       await api.sendPrompt(activeSessionId, text);
     } catch (e) {
@@ -51,10 +63,8 @@ export function useComposerActions(opts: {
           { kind: "system", id: uid("sys"), text: `错误：${e}` },
         ],
       }));
-    } finally {
-      setBusy(false);
     }
-  }, [input, stickToBottom, setTranscripts, scrollToBottom, setBusy, flash]);
+  }, [input, stickToBottom, setTranscripts, scrollToBottom, flash]);
 
   return {
     input,

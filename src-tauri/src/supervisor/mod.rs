@@ -47,6 +47,26 @@ pub struct Supervisor {
     state: Arc<StdMutex<DesktopState>>,
     /// ACP client-side terminal host (required when clientCapabilities.terminal=true)
     terminals: TerminalHost,
+    /// Serializes the probe→spawn→initialize→load pipeline. Concurrent
+    /// create/resume clicks used to each spawn their own `grok agent` +
+    /// `grok --version` — the "many grok processes" storm.
+    spawn_gate: Mutex<()>,
+    /// In-flight start guards: `proj:<id>` for create, `sess:<id>` for resume.
+    /// Rejects duplicate starts (double-click / impatient re-click) instead of
+    /// stacking processes.
+    starting: StdMutex<std::collections::HashSet<String>>,
+}
+
+/// RAII: removes the start-guard key when the create/resume attempt ends.
+struct StartGuard<'a> {
+    set: &'a StdMutex<std::collections::HashSet<String>>,
+    key: String,
+}
+
+impl Drop for StartGuard<'_> {
+    fn drop(&mut self) {
+        self.set.lock().remove(&self.key);
+    }
 }
 
 impl Supervisor {
@@ -61,7 +81,21 @@ impl Supervisor {
             sessions: Mutex::new(HashMap::new()),
             state,
             terminals,
+            spawn_gate: Mutex::new(()),
+            starting: StdMutex::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// Claim an exclusive start slot for `key`; `None` when already starting.
+    fn begin_start(&self, key: String) -> Option<StartGuard<'_>> {
+        let mut set = self.starting.lock();
+        if !set.insert(key.clone()) {
+            return None;
+        }
+        Some(StartGuard {
+            set: &self.starting,
+            key,
+        })
     }
 
     pub fn terminals(&self) -> &TerminalHost {
@@ -89,6 +123,11 @@ impl Supervisor {
         delegated_by: Option<String>,
         job_id: Option<String>,
     ) -> Result<LiveSession> {
+        // 同项目并发新建守卫：双击/连点曾各自 spawn 一个 grok agent（进程风暴）
+        let _start = self
+            .begin_start(format!("proj:{project_id}"))
+            .ok_or_else(|| anyhow!("该项目正在启动会话，请稍候…"))?;
+
         let prefs = self.state.lock().prefs.clone();
         let id = Uuid::new_v4().to_string();
         let title = title.unwrap_or_else(|| {
@@ -101,7 +140,8 @@ impl Supervisor {
 
         // cwd 先于一切检查：目录不存在时 spawn 只会报「无法启动 exe」，
         // 把真实原因（项目目录失效）埋掉。双击项目新建会话踩的就是这个。
-        if !PathBuf::from(&cwd).is_dir() {
+        // spawn_blocking：失效网络盘上的 is_dir 可能阻塞几十秒，别占 worker。
+        if !dir_exists(&cwd).await {
             return Err(anyhow!(
                 "项目工作目录不存在或不可访问：{cwd}。项目可能被移动/重命名/删除。请在左侧项目菜单中移除后重新添加。"
             ));
@@ -177,11 +217,33 @@ impl Supervisor {
         title: String,
         agent_id: Option<String>,
     ) -> Result<LiveSession> {
+        // 并发恢复守卫：同一会话的重复点击不再各起一个进程
+        let _start = self
+            .begin_start(format!("sess:{desktop_session_id}"))
+            .ok_or_else(|| anyhow!("该会话正在恢复中，请稍候…"))?;
+
         // Kill existing live process for this id if any
         self.hibernate(app.clone(), &desktop_session_id).await.ok();
 
+        // 同一 grok 会话可能已被别的桌面会话占着（磁盘历史每次恢复都发新
+        // 桌面 id）：先停掉旧进程，否则每次恢复都多留一个 grok agent。
+        let dup_ids: Vec<String> = {
+            let map = self.sessions.lock().await;
+            map.values()
+                .filter(|rt| {
+                    rt.meta.id != desktop_session_id
+                        && rt.meta.grok_session_id.as_deref() == Some(grok_session_id.as_str())
+                })
+                .map(|rt| rt.meta.id.clone())
+                .collect()
+        };
+        for dup in dup_ids {
+            tracing::info!("恢复去重：休眠占用同一 grok 会话的旧桌面会话 {dup}");
+            let _ = self.hibernate(app.clone(), &dup).await;
+        }
+
         // 同 create_session：cwd 失效时先给出真实原因，而不是误导性的「无法启动 exe」
-        if !PathBuf::from(&cwd).is_dir() {
+        if !dir_exists(&cwd).await {
             return Err(anyhow!(
                 "项目工作目录不存在或不可访问：{cwd}。项目可能被移动/重命名/删除。请在左侧项目菜单中移除后重新添加。"
             ));
@@ -284,6 +346,10 @@ impl Supervisor {
         load_session_id: Option<&str>,
         agent_id: &str,
     ) -> Result<(Arc<AcpClient>, String)> {
+        // 串行化整条 spawn 流水线（探测→spawn→initialize→load）。
+        // 并发 spawn 是进程风暴的放大器；启动本身只有几秒，排队可接受。
+        let _spawn_permit = self.spawn_gate.lock().await;
+
         // 按档案解析启动形态（agents.json；grok 之外纯配置驱动）
         let profiles = crate::agents::load();
         let profile = crate::agents::find(&profiles, agent_id).ok_or_else(|| {
@@ -321,12 +387,13 @@ impl Supervisor {
             } else {
                 prefs.min_cli_version.clone()
             };
-            // probe_environment spawns `grok --version` etc. synchronously — keep
-            // it off the async worker.
+            // Cached + hard-deadline version probe (5s timeout, 60s TTL):
+            // per-spawn `grok --version` with no deadline both multiplied
+            // processes and hung the spawn path when the CLI misbehaved.
             let installed = {
-                let p = prefs.clone();
+                let exe = grok_path.clone();
                 tokio::task::spawn_blocking(move || {
-                    crate::config::probe_environment(&p).grok_version
+                    crate::config::probe_grok_version_cached(&exe)
                 })
                 .await
                 .map_err(|e| anyhow!("CLI 探测失败：{e}"))?
@@ -353,7 +420,12 @@ impl Supervisor {
         let spec = crate::agents::build_spawn(profile, &model, always, &grok_exe);
         let client = AcpClient::spawn(&spec, PathBuf::from(cwd).as_path(), event_tx).await?;
 
-        client.initialize().await?;
+        // 每个失败路径都显式 kill：kill_on_drop / Job Object 是兜底，
+        // 显式杀死让「启动失败」立即回收进程树，而不是等 Arc 引用归零。
+        if let Err(e) = client.initialize().await {
+            let _ = client.kill().await;
+            return Err(anyhow!("Agent initialize 失败：{e}"));
+        }
 
         let result = if let Some(sid) = load_session_id {
             // Never fall back to session/new here: a silent new id leaves meta pointing
@@ -365,29 +437,40 @@ impl Supervisor {
                 Ok(v) => v,
                 Err(e) => {
                     tracing::warn!("session/load failed for {sid}: {e}");
-                    // kill_on_drop on AcpClient child cleans up the process
+                    let _ = client.kill().await;
                     return Err(anyhow!(
                         "session/load 失败（会话可能已失效、cwd 不匹配或 CLI 不支持恢复）：{e}。请从「磁盘会话历史」重新选择该会话。"
                     ));
                 }
             }
         } else {
-            client
+            match client
                 .session_new(PathBuf::from(cwd).as_path(), session_meta_json(prefs))
-                .await?
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = client.kill().await;
+                    return Err(anyhow!("session/new 失败：{e}"));
+                }
+            }
         };
 
         // session/new returns top-level sessionId; session/load often only puts it in
         // result._meta.sessionId (or omits it entirely). Fall back to the id we asked to load.
-        let grok_sid = extract_session_id(&result)
+        let grok_sid = match extract_session_id(&result)
             .or_else(|| load_session_id.map(|s| s.to_string()))
-            .ok_or_else(|| {
-                if load_session_id.is_some() {
+        {
+            Some(sid) => sid,
+            None => {
+                let _ = client.kill().await;
+                return Err(if load_session_id.is_some() {
                     anyhow!("session/load 未返回 sessionId：{result}")
                 } else {
                     anyhow!("session/new 未返回 sessionId：{result}")
-                }
-            })?;
+                });
+            }
+        };
 
         spawn_event_forwarder(
             app.clone(),
@@ -408,6 +491,13 @@ impl Supervisor {
             let rt = map
                 .get_mut(session_id)
                 .ok_or_else(|| anyhow!("会话不存在或已休眠：{session_id}"))?;
+            // 后端真值门禁：全局 busy 取消后由这里防并发 prompt
+            if rt.meta.status == "running" {
+                return Err(anyhow!("会话正在执行中，请等待本轮完成或先「停止」"));
+            }
+            if rt.meta.status == "waiting_permission" {
+                return Err(anyhow!("会话正在等待授权，请先处理授权请求"));
+            }
             rt.meta.status = "running".into();
             rt.meta.error = None;
             let _ = app.emit("agent://state", &rt.meta);
@@ -726,6 +816,34 @@ impl Supervisor {
         Ok(())
     }
 
+    /// 项目切换的进程回收：休眠**其他项目**里空闲/出错的活跃会话。
+    /// 运行中 / 等待授权的会话不动（切换永不打断在忙的轮次）。
+    /// 返回回收数量。会话 meta 保留，随时可一键恢复。
+    pub async fn hibernate_other_projects_idle(
+        &self,
+        app: AppHandle,
+        active_project_id: &str,
+    ) -> usize {
+        let victims: Vec<String> = {
+            let map = self.sessions.lock().await;
+            map.values()
+                .filter(|rt| {
+                    rt.meta.project_id != active_project_id
+                        && matches!(rt.meta.status.as_str(), "idle" | "error")
+                })
+                .map(|rt| rt.meta.id.clone())
+                .collect()
+        };
+        let n = victims.len();
+        for id in victims {
+            let _ = self.hibernate(app.clone(), &id).await;
+        }
+        if n > 0 {
+            tracing::info!("项目切换：回收其他项目的 {n} 个空闲 Agent 进程");
+        }
+        n
+    }
+
     pub async fn kill_all(&self) {
         self.terminals.release_all().await;
         let clients: Vec<Arc<AcpClient>> = {
@@ -773,6 +891,22 @@ impl Supervisor {
     }
 }
 
+/// Emit throttle for streaming events.
+///
+/// Every `app.emit` is dispatched onto the **main thread** (WebView2 must be
+/// driven from its creating thread). Per-token notifications × per-line stderr
+/// × N agent processes used to flood the Win32 message pump — the window could
+/// not even process move events (the "frozen, unmovable window" symptom).
+/// Notifications and stderr are therefore coalesced and flushed on a short
+/// interval; permission / server requests / exit stay immediate (flushing the
+/// buffer first to preserve ordering).
+const STREAM_FLUSH_MS: u64 = 40;
+/// Flush early when a batch grows this large (bounds payload size).
+const STREAM_BATCH_MAX: usize = 200;
+/// Cap buffered stderr lines per flush window (a crash-looping child can
+/// produce megabytes; the UI only needs the head).
+const STDERR_BATCH_MAX: usize = 200;
+
 fn spawn_event_forwarder(
     app: AppHandle,
     desktop_session_id: String,
@@ -780,136 +914,206 @@ fn spawn_event_forwarder(
     mut event_rx: mpsc::UnboundedReceiver<AcpEvent>,
 ) {
     tokio::spawn(async move {
-        while let Some(ev) = event_rx.recv().await {
-            match ev {
-                AcpEvent::Notification { method, params } => {
+        let mut stream_buf: Vec<Value> = Vec::new();
+        let mut stderr_buf: Vec<String> = Vec::new();
+        let mut stderr_dropped: usize = 0;
+        let mut flush_tick =
+            tokio::time::interval(std::time::Duration::from_millis(STREAM_FLUSH_MS));
+        flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+        macro_rules! flush {
+            () => {
+                if !stream_buf.is_empty() {
+                    let events = std::mem::take(&mut stream_buf);
                     let _ = app.emit(
-                        "agent://stream",
+                        "agent://streamBatch",
                         json!({
                             "sessionId": desktop_session_id,
-                            "method": method,
-                            "params": params
+                            "events": events
                         }),
                     );
                 }
-                AcpEvent::ServerRequest { id, method, params } => {
-                    let method_l = method.to_ascii_lowercase();
-                    if method_l.contains("permission") {
-                        let _ = app.emit(
-                            "agent://permission",
-                            json!({
-                                "sessionId": desktop_session_id,
-                                "id": id,
-                                "method": method,
-                                "params": params
-                            }),
-                        );
-                        let _ = app.emit(
-                            "agent://state",
-                            json!({
-                                "id": desktop_session_id,
-                                "status": "waiting_permission"
-                            }),
-                        );
-                        continue;
+                if !stderr_buf.is_empty() || stderr_dropped > 0 {
+                    let mut text = std::mem::take(&mut stderr_buf).join("\n");
+                    let dropped = std::mem::take(&mut stderr_dropped);
+                    if dropped > 0 {
+                        text.push_str(&format!("\n…（另有 {dropped} 行 stderr 被省略）"));
                     }
-
-                    // Handle terminal/* and fs/* in Rust immediately.
-                    // Shell tools break if terminal/create waits on the UI hop.
-                    if method_l.starts_with("terminal/")
-                        || method_l.starts_with("fs/")
-                        || method_l.contains("read_text_file")
-                        || method_l.contains("write_text_file")
-                    {
-                        if let Some(state) = app.try_state::<crate::commands::AppState>() {
-                            let supervisor = state.supervisor.clone();
-                            let sid = desktop_session_id.clone();
-                            let method_owned = method.clone();
-                            let params_owned = params.clone();
-                            let req_id = id.clone();
-                            // Detach so we can still process concurrent ACP messages
-                            // (e.g. terminal/output while wait_for_exit is pending).
-                            tokio::spawn(async move {
-                                match supervisor
-                                    .handle_client_request(
-                                        &sid,
-                                        req_id.clone(),
-                                        &method_owned,
-                                        &params_owned,
-                                    )
-                                    .await
-                                {
-                                    Ok(true) => {}
-                                    Ok(false) => {
-                                        let _ = supervisor
-                                            .respond_server_request(
-                                                &sid,
-                                                req_id,
-                                                None,
-                                                Some(format!(
-                                                    "未处理的客户端方法：{method_owned}"
-                                                )),
-                                            )
-                                            .await;
-                                    }
-                                    Err(e) => {
-                                        tracing::error!(
-                                            "client request {method_owned} failed: {e}"
-                                        );
-                                        let _ = supervisor
-                                            .respond_server_request(
-                                                &sid,
-                                                req_id,
-                                                None,
-                                                Some(e.to_string()),
-                                            )
-                                            .await;
-                                    }
-                                }
-                            });
-                            continue;
-                        }
-                    }
-
-                    // Fallback: forward unknown server requests to UI
-                    let _ = app.emit(
-                        "agent://serverRequest",
-                        json!({
-                            "sessionId": desktop_session_id,
-                            "id": id,
-                            "method": method,
-                            "params": params
-                        }),
-                    );
-                }
-                AcpEvent::Stderr { text } => {
                     let _ = app.emit(
                         "agent://stderr",
                         json!({ "sessionId": desktop_session_id, "text": text }),
                     );
                 }
-                AcpEvent::Exited { code } => {
-                    // Route through mark_exited_if_current: emitting directly
-                    // here would let a stale exit (replaced/hibernated client)
-                    // clobber the new session state in the UI.
-                    if let Some(state) = app.try_state::<crate::commands::AppState>() {
-                        state
-                            .supervisor
-                            .mark_exited_if_current(
+            };
+        }
+
+        loop {
+            tokio::select! {
+                ev = event_rx.recv() => {
+                    let Some(ev) = ev else {
+                        flush!();
+                        break;
+                    };
+                    match ev {
+                        AcpEvent::Notification { method, params } => {
+                            stream_buf.push(json!({ "method": method, "params": params }));
+                            if stream_buf.len() >= STREAM_BATCH_MAX {
+                                flush!();
+                            }
+                        }
+                        AcpEvent::Stderr { text } => {
+                            if stderr_buf.len() < STDERR_BATCH_MAX {
+                                stderr_buf.push(text);
+                            } else {
+                                stderr_dropped += 1;
+                            }
+                        }
+                        AcpEvent::ParseError { line, error } => {
+                            tracing::warn!("ACP parse error: {error} line={line}");
+                        }
+                        // 请求/退出必须即时处理；先冲刷缓冲保证事件顺序
+                        other => {
+                            flush!();
+                            handle_immediate_event(
                                 &app,
                                 &desktop_session_id,
-                                code,
                                 client_instance,
+                                other,
                             )
                             .await;
+                        }
                     }
                 }
-                AcpEvent::ParseError { line, error } => {
-                    tracing::warn!("ACP parse error: {error} line={line}");
+                _ = flush_tick.tick() => {
+                    flush!();
                 }
             }
         }
     });
+}
+
+/// ServerRequest / Exited handling (unchanged semantics; extracted so the
+/// batching loop stays readable).
+async fn handle_immediate_event(
+    app: &AppHandle,
+    desktop_session_id: &str,
+    client_instance: u64,
+    ev: AcpEvent,
+) {
+    match ev {
+        AcpEvent::ServerRequest { id, method, params } => {
+            let method_l = method.to_ascii_lowercase();
+            if method_l.contains("permission") {
+                let _ = app.emit(
+                    "agent://permission",
+                    json!({
+                        "sessionId": desktop_session_id,
+                        "id": id,
+                        "method": method,
+                        "params": params
+                    }),
+                );
+                let _ = app.emit(
+                    "agent://state",
+                    json!({
+                        "id": desktop_session_id,
+                        "status": "waiting_permission"
+                    }),
+                );
+                return;
+            }
+
+            // Handle terminal/* and fs/* in Rust immediately.
+            // Shell tools break if terminal/create waits on the UI hop.
+            if method_l.starts_with("terminal/")
+                || method_l.starts_with("fs/")
+                || method_l.contains("read_text_file")
+                || method_l.contains("write_text_file")
+            {
+                if let Some(state) = app.try_state::<crate::commands::AppState>() {
+                    let supervisor = state.supervisor.clone();
+                    let sid = desktop_session_id.to_string();
+                    let method_owned = method.clone();
+                    let params_owned = params.clone();
+                    let req_id = id.clone();
+                    // Detach so we can still process concurrent ACP messages
+                    // (e.g. terminal/output while wait_for_exit is pending).
+                    tokio::spawn(async move {
+                        match supervisor
+                            .handle_client_request(
+                                &sid,
+                                req_id.clone(),
+                                &method_owned,
+                                &params_owned,
+                            )
+                            .await
+                        {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                let _ = supervisor
+                                    .respond_server_request(
+                                        &sid,
+                                        req_id,
+                                        None,
+                                        Some(format!(
+                                            "未处理的客户端方法：{method_owned}"
+                                        )),
+                                    )
+                                    .await;
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    "client request {method_owned} failed: {e}"
+                                );
+                                let _ = supervisor
+                                    .respond_server_request(
+                                        &sid,
+                                        req_id,
+                                        None,
+                                        Some(e.to_string()),
+                                    )
+                                    .await;
+                            }
+                        }
+                    });
+                    return;
+                }
+            }
+
+            // Fallback: forward unknown server requests to UI
+            let _ = app.emit(
+                "agent://serverRequest",
+                json!({
+                    "sessionId": desktop_session_id,
+                    "id": id,
+                    "method": method,
+                    "params": params
+                }),
+            );
+        }
+        AcpEvent::Exited { code } => {
+            // Route through mark_exited_if_current: emitting directly
+            // here would let a stale exit (replaced/hibernated client)
+            // clobber the new session state in the UI.
+            if let Some(state) = app.try_state::<crate::commands::AppState>() {
+                state
+                    .supervisor
+                    .mark_exited_if_current(app, desktop_session_id, code, client_instance)
+                    .await;
+            }
+        }
+        // Notification / Stderr / ParseError 由批量循环处理，不会走到这里
+        _ => {}
+    }
+}
+
+/// `Path::is_dir` off the async workers: a dead network drive can block for
+/// tens of seconds and must not stall the runtime.
+async fn dir_exists(path: &str) -> bool {
+    let p = PathBuf::from(path);
+    tokio::task::spawn_blocking(move || p.is_dir())
+        .await
+        .unwrap_or(false)
 }
 
 fn session_meta_json(prefs: &DesktopPrefs) -> Value {

@@ -258,9 +258,8 @@ export default function App() {
     resumeInFlightRef,
   });
 
-  // —— 输入 / 润色 / 发送
+  // —— 输入 / 润色 / 发送（不再持全局 busy，按会话状态门禁）
   const { input, setInput, sendPrompt } = useComposerActions({
-    setBusy,
     stickToBottom,
     scrollToBottom,
     flash,
@@ -559,31 +558,36 @@ export default function App() {
     applyTheme(prefs.theme || "light");
   }, [prefs.theme]);
 
-  // Tray aggregate status + focus target for tray / second-instance
+  // Tray aggregate status + focus target for tray / second-instance.
+  // 防抖 250ms：live 在流式/启动期间高频变化，逐次 IPC 更新托盘会
+  // 给主线程事件泵添堵（托盘调用最终都在主线程执行）。
   useEffect(() => {
-    const waiting = live.filter((s) => s.status === "waiting_permission");
-    const running = live.filter((s) => s.status === "running");
-    const errors = live.filter((s) => s.status === "error");
-    let level = "idle";
-    let detail = "";
-    let focusId: string | null = null;
-    if (waiting.length) {
-      level = "needs_attention";
-      detail = waiting[0].title;
-      focusId = waiting[0].id;
-    } else if (errors.length) {
-      level = "error";
-      detail = errors[0].title;
-      focusId = errors[0].id;
-    } else if (running.length) {
-      level = "running";
-      detail = `${running.length} 个任务`;
-      focusId = running[0].id;
-    } else if (live.length) {
-      detail = `${live.length} 个会话`;
-      focusId = live[0].id;
-    }
-    void api.updateTrayStatus(level, detail, focusId).catch(() => {});
+    const t = window.setTimeout(() => {
+      const waiting = live.filter((s) => s.status === "waiting_permission");
+      const running = live.filter((s) => s.status === "running");
+      const errors = live.filter((s) => s.status === "error");
+      let level = "idle";
+      let detail = "";
+      let focusId: string | null = null;
+      if (waiting.length) {
+        level = "needs_attention";
+        detail = waiting[0].title;
+        focusId = waiting[0].id;
+      } else if (errors.length) {
+        level = "error";
+        detail = errors[0].title;
+        focusId = errors[0].id;
+      } else if (running.length) {
+        level = "running";
+        detail = `${running.length} 个任务`;
+        focusId = running[0].id;
+      } else if (live.length) {
+        detail = `${live.length} 个会话`;
+        focusId = live[0].id;
+      }
+      void api.updateTrayStatus(level, detail, focusId).catch(() => {});
+    }, 250);
+    return () => window.clearTimeout(t);
   }, [live]);
 
   // Strip silent / hidden raw events when switching sessions or prefs change
@@ -663,6 +667,13 @@ export default function App() {
           setActiveProjectId(id);
           setShowDashboard(false);
           setProjectMenuId(null);
+          // 进程回收：休眠其他项目的空闲会话（运行中/待授权不动），
+          // 再按后端真值刷新活跃列表，防止 grok 进程随切换次数堆积
+          void api
+            .setActiveProject(id)
+            .then(() => api.listLiveSessions())
+            .then(setLive)
+            .catch(() => {});
         }}
         onAddProject={() => void addProject()}
         onCreateSession={(p) => void createSession(p, selectedAgentId)}
@@ -835,7 +846,11 @@ export default function App() {
           agentName={agentName(activeLive?.agentId)}
           input={input}
           setInput={setInput}
-          busy={busy}
+          busy={
+            busy ||
+            activeLive?.status === "running" ||
+            activeLive?.status === "waiting_permission"
+          }
           statusHint={statusLabel(activeLive?.status)}
           showStop={
             !!(

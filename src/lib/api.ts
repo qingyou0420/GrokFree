@@ -113,6 +113,9 @@ export const api = {
     }),
   hibernateSession: (sessionId: string) =>
     invoke<void>("hibernate_session", { sessionId }),
+  /** 项目切换钩子：休眠其他项目的空闲会话（回收 grok 进程），返回回收数 */
+  setActiveProject: (projectId: string) =>
+    invoke<number>("set_active_project", { projectId }),
   gitStatus: (cwd: string) => invoke<GitStatus>("git_status", { cwd }),
   applyDiff: (cwd: string, path: string, patch: string) =>
     invoke<ApplyDiffResult>("apply_diff", { cwd, path, patch }),

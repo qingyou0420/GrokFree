@@ -18,6 +18,10 @@ type Flash = (
 ) => void;
 type SetPermission = (p: PermissionReq | null) => void;
 
+function uid(p: string) {
+  return `${p}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+}
+
 /**
  * 六个 api.on 事件的注册/清理 + 状态迁移 toast（任务完成 / 出错）。
  * 自 App.tsx 原样抽取；agent://stream 依赖 applyStream 的
@@ -60,17 +64,22 @@ export function useAgentEvents(opts: {
         return;
       }
       unsubs.push(
+        // 后端把流式通知按 ~40ms 窗口合批（agent://streamBatch）：
+        // 逐 token 逐条 emit 会打满 Windows 主线程事件泵（窗口拖不动）。
         await api.on<{
           sessionId: string;
-          method: string;
-          params: Record<string, unknown>;
-        }>("agent://stream", (p) => {
+          events: Array<{ method: string; params: Record<string, unknown> }>;
+        }>("agent://streamBatch", (p) => {
+          if (!p.events?.length) return;
           setTranscripts((prev) => {
             const cur = prev[p.sessionId] ?? [];
             const showRaw = prefsRef.current.showRawAcpEvents === true;
-            const next = applyStream(cur, p.method, p.params || {}, {
-              showRawAcpEvents: showRaw,
-            });
+            let next = cur;
+            for (const ev of p.events) {
+              next = applyStream(next, ev.method, ev.params || {}, {
+                showRawAcpEvents: showRaw,
+              });
+            }
             // 静默事件 / 无变化：保持原引用，跳过整个 map 更新与重渲染
             if (next === cur) return prev;
             return { ...prev, [p.sessionId]: next };
@@ -90,9 +99,26 @@ export function useAgentEvents(opts: {
         await api.on<LiveSession | { id: string; status: string; error?: string }>(
           "agent://state",
           (p) => {
+            // 休眠 = 进程已回收：连带清掉排队消息与静默提示
+            if ((p as LiveSession).status === "hibernated") {
+              const id = (p as LiveSession).id;
+              if (id) {
+                const store = useSessionStore.getState();
+                store.clearStall(id);
+                const dropped = store.clearSendQueue(id);
+                if (dropped.length > 0) {
+                  flash(`会话已休眠，丢弃 ${dropped.length} 条排队消息`, "info", id);
+                }
+              }
+            }
             setLive((prev) => {
               const id = (p as LiveSession).id;
               if (!id) return prev;
+              // 休眠 = 进程已回收：从活跃列表移除（切项目自动回收也走这里），
+              // 否则带 cwd 的 hibernated 事件会把幽灵会话塞回列表
+              if ((p as LiveSession).status === "hibernated") {
+                return prev.filter((s) => s.id !== id);
+              }
               const idx = prev.findIndex((s) => s.id === id);
               if (idx >= 0) {
                 const next = [...prev];
@@ -111,6 +137,32 @@ export function useAgentEvents(opts: {
           void notifyOs("GrokFree", "小精灵请求权限批准");
           flash("小精灵等待权限批准 — 点击跳转", "info", p.sessionId);
         })
+      );
+      unsubs.push(
+        // 「本会话内允许」缓存命中：后端已自动批准，仅提示不打断
+        await api.on<{ sessionId: string; scope: string }>(
+          "agent://permissionAuto",
+          (p) => {
+            flash(`已按「本会话内允许」自动批准（${p.scope}）`, "info", p.sessionId);
+          }
+        )
+      );
+      unsubs.push(
+        // 静默看门狗：只提示「继续等待 / 结束本轮」，绝不自动取消
+        await api.on<{ sessionId: string; title: string; silentSecs: number }>(
+          "agent://stall",
+          (p) => {
+            useSessionStore.getState().setStall(p.sessionId, {
+              title: p.title,
+              silentSecs: p.silentSecs,
+            });
+            flash(
+              `「${p.title}」已静默 ${Math.round(p.silentSecs / 60)} 分钟 — 点击查看`,
+              "info",
+              p.sessionId
+            );
+          }
+        )
       );
       if (disposed) {
         unsubs.splice(0).forEach((u) => u());
@@ -138,7 +190,7 @@ export function useAgentEvents(opts: {
     };
   }, [setState, setLive, setPermission, setTranscripts, prefsRef, focusRef, notifyOs, flash]);
 
-  // Task complete toast when status leaves running
+  // Task complete toast when status leaves running + 排队消息接力发送
   const live = useSessionStore((s) => s.live);
   const prevStatus = useRef<Record<string, string>>({});
   useEffect(() => {
@@ -148,8 +200,45 @@ export function useAgentEvents(opts: {
         flash(`任务完成：${s.title} — 点击跳转`, "success", s.id);
         void notifyOs("任务完成", s.title);
       }
+      // 轮次结束（idle）：清静默提示，接力发送下一条排队消息
+      if (
+        (prev === "running" || prev === "waiting_permission") &&
+        s.status === "idle"
+      ) {
+        const store = useSessionStore.getState();
+        store.clearStall(s.id);
+        const next = store.takeNextSend(s.id);
+        if (next != null) {
+          // 发送时才补用户块，保证 transcript 顺序（排队期间上一轮还在追加）
+          store.setTranscripts((prevT) => ({
+            ...prevT,
+            [s.id]: [
+              ...(prevT[s.id] ?? []),
+              { kind: "user", id: uid("u"), text: next },
+            ],
+          }));
+          const remain = (store.sendQueue[s.id] ?? []).length;
+          flash(
+            remain > 0
+              ? `发送排队消息（还剩 ${remain} 条）`
+              : "发送排队消息",
+            "info",
+            s.id
+          );
+          void api.sendPrompt(s.id, next).catch((e) => {
+            flash(`排队消息发送失败：${e}`, "error", s.id);
+          });
+        }
+      }
       if (s.status === "error" && prev !== "error") {
         flash(s.error || `会话出错：${s.title}`, "error", s.id);
+        // 会话出错：丢弃排队消息并告知（不要静默吞掉）
+        const store = useSessionStore.getState();
+        store.clearStall(s.id);
+        const dropped = store.clearSendQueue(s.id);
+        if (dropped.length > 0) {
+          flash(`会话出错，已丢弃 ${dropped.length} 条排队消息`, "error", s.id);
+        }
       }
       prevStatus.current[s.id] = s.status;
     }

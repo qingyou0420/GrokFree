@@ -24,6 +24,7 @@ import { Sidebar } from "./components/Sidebar";
 import { ToastStack } from "./components/ToastStack";
 import { Topbar } from "./components/Topbar";
 import { api, errorText } from "./lib/api";
+import { initJournalSync } from "./lib/journalSync";
 import { isPlaceholderTitle, latestPlan, scrubTranscript } from "./lib/acp-parse";
 import { applyTheme } from "./lib/theme";
 import { statusLabel } from "./lib/i18n";
@@ -57,7 +58,7 @@ import {
   type ConfirmState,
 } from "./state";
 
-const APP_VERSION = "0.9.0";
+const APP_VERSION = "0.9.1";
 
 const defaultPrefs: DesktopPrefs = {
   grokPath: "",
@@ -97,6 +98,14 @@ export default function App() {
       ? s.transcripts[activeSessionId] ?? EMPTY_BLOCKS
       : EMPTY_BLOCKS
   );
+  // 忙时排队 / 静默看门狗（当前会话）
+  const queuedCount = useSessionStore((s) =>
+    activeSessionId ? s.sendQueue[activeSessionId]?.length ?? 0 : 0
+  );
+  const activeStall = useSessionStore((s) =>
+    activeSessionId ? s.stall[activeSessionId] ?? null : null
+  );
+  const clearStall = useSessionStore((s) => s.clearStall);
   const historyTail = useUiStore((s) => s.historyTail);
   const showSettings = useUiStore((s) => s.showSettings);
   const setShowSettings = useUiStore((s) => s.setShowSettings);
@@ -258,9 +267,8 @@ export default function App() {
     resumeInFlightRef,
   });
 
-  // —— 输入 / 润色 / 发送
+  // —— 输入 / 润色 / 发送（不再持全局 busy，按会话状态门禁）
   const { input, setInput, sendPrompt } = useComposerActions({
-    setBusy,
     stickToBottom,
     scrollToBottom,
     flash,
@@ -349,7 +357,7 @@ export default function App() {
   });
 
   // —— 恢复会话（依赖 loadTranscriptForSession，必须在 useSessionActions 之后）
-  const { resumeMeta, resumeDiskSession } = useResumeSession({
+  const { resumeMeta, resumeDiskSession, resuming } = useResumeSession({
     busy,
     setBusy,
     projects,
@@ -537,6 +545,8 @@ export default function App() {
   useEffect(() => {
     if (booted.current) return;
     booted.current = true;
+    // 自有日志节流落盘（≥500ms；实时事件为真值，CLI 历史降级为兜底）
+    initJournalSync();
     refresh().catch((e) => flash(String(e), "error"));
     void refreshAgents();
   }, [refresh, flash, refreshAgents]);
@@ -559,31 +569,36 @@ export default function App() {
     applyTheme(prefs.theme || "light");
   }, [prefs.theme]);
 
-  // Tray aggregate status + focus target for tray / second-instance
+  // Tray aggregate status + focus target for tray / second-instance.
+  // 防抖 250ms：live 在流式/启动期间高频变化，逐次 IPC 更新托盘会
+  // 给主线程事件泵添堵（托盘调用最终都在主线程执行）。
   useEffect(() => {
-    const waiting = live.filter((s) => s.status === "waiting_permission");
-    const running = live.filter((s) => s.status === "running");
-    const errors = live.filter((s) => s.status === "error");
-    let level = "idle";
-    let detail = "";
-    let focusId: string | null = null;
-    if (waiting.length) {
-      level = "needs_attention";
-      detail = waiting[0].title;
-      focusId = waiting[0].id;
-    } else if (errors.length) {
-      level = "error";
-      detail = errors[0].title;
-      focusId = errors[0].id;
-    } else if (running.length) {
-      level = "running";
-      detail = `${running.length} 个任务`;
-      focusId = running[0].id;
-    } else if (live.length) {
-      detail = `${live.length} 个会话`;
-      focusId = live[0].id;
-    }
-    void api.updateTrayStatus(level, detail, focusId).catch(() => {});
+    const t = window.setTimeout(() => {
+      const waiting = live.filter((s) => s.status === "waiting_permission");
+      const running = live.filter((s) => s.status === "running");
+      const errors = live.filter((s) => s.status === "error");
+      let level = "idle";
+      let detail = "";
+      let focusId: string | null = null;
+      if (waiting.length) {
+        level = "needs_attention";
+        detail = waiting[0].title;
+        focusId = waiting[0].id;
+      } else if (errors.length) {
+        level = "error";
+        detail = errors[0].title;
+        focusId = errors[0].id;
+      } else if (running.length) {
+        level = "running";
+        detail = `${running.length} 个任务`;
+        focusId = running[0].id;
+      } else if (live.length) {
+        detail = `${live.length} 个会话`;
+        focusId = live[0].id;
+      }
+      void api.updateTrayStatus(level, detail, focusId).catch(() => {});
+    }, 250);
+    return () => window.clearTimeout(t);
   }, [live]);
 
   // Strip silent / hidden raw events when switching sessions or prefs change
@@ -663,6 +678,13 @@ export default function App() {
           setActiveProjectId(id);
           setShowDashboard(false);
           setProjectMenuId(null);
+          // 进程回收：休眠其他项目的空闲会话（运行中/待授权不动），
+          // 再按后端真值刷新活跃列表，防止 grok 进程随切换次数堆积
+          void api
+            .setActiveProject(id)
+            .then(() => api.listLiveSessions())
+            .then(setLive)
+            .catch(() => {});
         }}
         onAddProject={() => void addProject()}
         onCreateSession={(p) => void createSession(p, selectedAgentId)}
@@ -830,12 +852,52 @@ export default function App() {
           </div>
         </div>
 
+        {activeStall && activeLive && (
+          <div className="stall-banner" role="status">
+            <span>
+              小精灵已静默约 {Math.max(1, Math.round(activeStall.silentSecs / 60))}{" "}
+              分钟。可能仍在思考/等待长任务；不会自动取消。
+            </span>
+            <span className="spacer" />
+            <button
+              type="button"
+              className="btn sm"
+              onClick={() => {
+                clearStall(activeLive.id);
+                void api
+                  .stallKeepWaiting(activeLive.id)
+                  .catch((e) => flash(String(e), "error"));
+              }}
+            >
+              继续等待
+            </button>
+            <button
+              type="button"
+              className="btn sm danger"
+              onClick={() => {
+                clearStall(activeLive.id);
+                void api
+                  .cancelPrompt(activeLive.id)
+                  .then(() => flash("已请求结束本轮", "info"))
+                  .catch((e) => flash(String(e), "error"));
+              }}
+            >
+              结束本轮
+            </button>
+          </div>
+        )}
+
         <Composer
           activeSessionId={activeSessionId}
           agentName={agentName(activeLive?.agentId)}
           input={input}
           setInput={setInput}
           busy={busy}
+          turnRunning={
+            activeLive?.status === "running" ||
+            activeLive?.status === "waiting_permission"
+          }
+          queuedCount={queuedCount}
           statusHint={statusLabel(activeLive?.status)}
           showStop={
             !!(
@@ -853,6 +915,25 @@ export default function App() {
           onSend={() => void sendPrompt()}
         />
       </main>
+
+      {resuming && (
+        <div className="resume-banner" role="status">
+          <span className="chat-paint-spinner" />
+          <span>正在恢复会话「{resuming.title}」…</span>
+          <button
+            type="button"
+            className="btn sm"
+            onClick={() => {
+              void api
+                .cancelStart(resuming.id)
+                .then(() => flash("已取消恢复", "info"))
+                .catch((e) => flash(String(e), "error"));
+            }}
+          >
+            取消
+          </button>
+        </div>
+      )}
 
       {showReview && (
         <div className="review-col">
@@ -952,8 +1033,8 @@ export default function App() {
       {permission && (
         <PermissionModal
           request={permission}
-          onRespond={(allow, optionId) => {
-            void respondPermission(allow, optionId);
+          onRespond={(allow, optionId, rememberSession) => {
+            void respondPermission(allow, optionId, rememberSession);
           }}
         />
       )}

@@ -438,6 +438,14 @@ impl TerminalHost {
             .ok_or_else(|| anyhow!("未知终端：{id}"))
     }
 
+    /// True when the session still has a live (un-exited) terminal.
+    /// 静默看门狗把它当作「长工具心跳」：终端在跑 = 不算失速。
+    pub async fn session_has_running(&self, session_id: &str) -> bool {
+        let map = self.inner.read().await;
+        map.values()
+            .any(|t| t.session_id == session_id && t.exit.lock().is_none())
+    }
+
     /// Drop all terminals belonging to a desktop session.
     pub async fn release_session(&self, session_id: &str) {
         let ids: Vec<String> = {

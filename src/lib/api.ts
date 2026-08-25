@@ -77,6 +77,12 @@ export const api = {
     }),
   renameSession: (sessionId: string, title: string) =>
     invoke<DesktopState>("rename_session", { sessionId, title }),
+  /** 自有会话日志：读取快照（无日志返回 null，退回 CLI 历史） */
+  loadJournal: (sessionId: string) =>
+    invoke<ChatBlock[] | null>("load_journal", { sessionId }),
+  /** 自有会话日志：保存快照（journalSync 节流后调用） */
+  saveJournal: (sessionId: string, blocks: ChatBlock[]) =>
+    invoke<void>("save_journal", { sessionId, blocks }),
   removeSessionMeta: (sessionId: string) =>
     invoke<DesktopState>("remove_session_meta", { sessionId }),
   purgeStaleSessionMeta: (projectId?: string | null) =>
@@ -91,14 +97,22 @@ export const api = {
     sessionId: string,
     requestId: unknown,
     allow: boolean,
-    optionId?: string
+    optionId?: string,
+    rememberScope?: string | null
   ) =>
     invoke<void>("respond_permission", {
       sessionId,
       requestId,
       allow,
       optionId: optionId ?? null,
+      rememberScope: rememberScope ?? null,
     }),
+  /** 静默提示「继续等待」：重置该会话的静默计时 */
+  stallKeepWaiting: (sessionId: string) =>
+    invoke<void>("stall_keep_waiting", { sessionId }),
+  /** 取消在途的会话启动/恢复（杀 initialize/load 中的进程） */
+  cancelStart: (sessionId: string) =>
+    invoke<void>("cancel_start", { sessionId }),
   handleServerRequest: (
     sessionId: string,
     requestId: unknown,
@@ -113,6 +127,9 @@ export const api = {
     }),
   hibernateSession: (sessionId: string) =>
     invoke<void>("hibernate_session", { sessionId }),
+  /** 项目切换钩子：休眠其他项目的空闲会话（回收 grok 进程），返回回收数 */
+  setActiveProject: (projectId: string) =>
+    invoke<number>("set_active_project", { projectId }),
   gitStatus: (cwd: string) => invoke<GitStatus>("git_status", { cwd }),
   applyDiff: (cwd: string, path: string, patch: string) =>
     invoke<ApplyDiffResult>("apply_diff", { cwd, path, patch }),

@@ -480,12 +480,16 @@ export function Sidebar({
                   title={busy ? "正在恢复…" : "点击恢复 · 双击重命名"}
                 >
                   <span className="name">
-                    <span className="status-dot" />
+                    <span
+                      className={`status-dot ${
+                        s.status === "interrupted" ? "needs-input" : ""
+                      }`}
+                    />
                     {s.title}
                   </span>
                   <span className="meta">
                     {agentName(s.agentId) ? `${agentName(s.agentId)} · ` : ""}
-                    休眠
+                    {s.status === "interrupted" ? "上轮中断" : "休眠"}
                     {s.lastActiveAt ? ` · ${relativeTime(s.lastActiveAt)}` : ""}
                   </span>
                 </button>

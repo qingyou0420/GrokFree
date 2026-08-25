@@ -16,6 +16,14 @@ type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>;
 /// from the current client of a session or a stale one that was replaced.
 static INSTANCE_SEQ: AtomicU64 = AtomicU64::new(1);
 
+/// Default request budget (prompt turns can legitimately run for minutes).
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 600;
+/// Handshake / session bootstrap budgets: fail fast so a wedged CLI cannot
+/// hold the spawn path (and the UI) hostage for 10 minutes per request.
+const INIT_TIMEOUT_SECS: u64 = 30;
+const SESSION_NEW_TIMEOUT_SECS: u64 = 60;
+const SESSION_LOAD_TIMEOUT_SECS: u64 = 120;
+
 pub struct AcpClient {
     instance: u64,
     child: Mutex<Child>,
@@ -213,8 +221,10 @@ impl AcpClient {
     }
 
     pub async fn initialize(&self) -> Result<Value> {
+        // Handshake must fail fast: a wedged CLI here used to hold the spawn
+        // path (and the UI busy state) for the full 600s prompt timeout.
         let result = self
-            .request(
+            .request_with_timeout(
                 "initialize",
                 json!({
                     "protocolVersion": 1,
@@ -227,6 +237,7 @@ impl AcpClient {
                         "terminal": true
                     }
                 }),
+                std::time::Duration::from_secs(INIT_TIMEOUT_SECS),
             )
             .await?;
         *self.agent_info.lock().await = Some(result.clone());
@@ -234,13 +245,14 @@ impl AcpClient {
     }
 
     pub async fn session_new(&self, cwd: &Path, meta: Value) -> Result<Value> {
-        self.request(
+        self.request_with_timeout(
             "session/new",
             json!({
                 "cwd": cwd.to_string_lossy(),
                 "mcpServers": [],
                 "_meta": meta
             }),
+            std::time::Duration::from_secs(SESSION_NEW_TIMEOUT_SECS),
         )
         .await
     }
@@ -248,13 +260,15 @@ impl AcpClient {
     pub async fn session_load(&self, session_id: &str, cwd: &Path) -> Result<Value> {
         // CLI ≥0.2 requires `mcpServers` on session/load (same as session/new).
         // Omitting it yields: Invalid params — missing field `mcpServers`.
-        self.request(
+        // Longer budget than initialize: the CLI replays the whole history.
+        self.request_with_timeout(
             "session/load",
             json!({
                 "sessionId": session_id,
                 "cwd": cwd.to_string_lossy(),
                 "mcpServers": []
             }),
+            std::time::Duration::from_secs(SESSION_LOAD_TIMEOUT_SECS),
         )
         .await
     }
@@ -271,8 +285,14 @@ impl AcpClient {
     }
 
     pub async fn cancel(&self, session_id: &str) -> Result<Value> {
+        // 短超时：CLI 真挂死时不能让「停止/结束本轮」自己也挂 10 分钟，
+        // 快速退回通知式 cancel（fire-and-forget）。
         match self
-            .request("session/cancel", json!({ "sessionId": session_id }))
+            .request_with_timeout(
+                "session/cancel",
+                json!({ "sessionId": session_id }),
+                std::time::Duration::from_secs(5),
+            )
             .await
         {
             Ok(v) => Ok(v),
@@ -303,6 +323,20 @@ impl AcpClient {
     }
 
     pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
+        self.request_with_timeout(
+            method,
+            params,
+            std::time::Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS),
+        )
+        .await
+    }
+
+    pub async fn request_with_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: std::time::Duration,
+    ) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         {
@@ -320,13 +354,13 @@ impl AcpClient {
             map.remove(&id);
             return Err(e);
         }
-        match tokio::time::timeout(std::time::Duration::from_secs(600), rx).await {
+        match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(res)) => res,
             Ok(Err(_)) => Err(anyhow!("请求通道已关闭：{method}")),
             Err(_) => {
                 let mut map = self.pending.lock().await;
                 map.remove(&id);
-                Err(anyhow!("请求超时：{method}"))
+                Err(anyhow!("请求超时（{}s）：{method}", timeout.as_secs()))
             }
         }
     }

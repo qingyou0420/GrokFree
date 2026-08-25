@@ -21,16 +21,20 @@ pub struct AppState {
     pub focus_session: Arc<StdMutex<Option<String>>>,
 }
 
+// NOTE: Tauri 把**同步** command 放在主线程执行。这里所有做文件 IO / 抢
+// desktop 锁 / 起子进程的 command 一律 async（跑在 async runtime 上），
+// 否则一次慢写盘 / 锁等待就会冻住整个窗口（连拖动都不行）。
+
 #[tauri::command]
-pub fn get_app_state(state: State<'_, AppState>) -> DesktopState {
+pub async fn get_app_state(state: State<'_, AppState>) -> Result<DesktopState, String> {
     // 返回内存态；勿每次磁盘重载，否则会与前端轮询/聚焦形成闪烁与状态抖动
-    state.desktop.lock().clone()
+    Ok(state.desktop.lock().clone())
 }
 
 #[tauri::command]
-pub fn reload_state(state: State<'_, AppState>) -> DesktopState {
+pub async fn reload_state(state: State<'_, AppState>) -> Result<DesktopState, String> {
     DesktopState::reload_into(&state.desktop);
-    state.desktop.lock().clone()
+    Ok(state.desktop.lock().clone())
 }
 
 #[tauri::command]
@@ -42,12 +46,14 @@ pub async fn probe_environment(state: State<'_, AppState>) -> Result<config::Gro
 }
 
 #[tauri::command]
-pub fn update_prefs(state: State<'_, AppState>, prefs: DesktopPrefs) -> Result<DesktopState, String> {
+pub async fn update_prefs(state: State<'_, AppState>, prefs: DesktopPrefs) -> Result<DesktopState, String> {
     {
         let mut st = state.desktop.lock();
         st.prefs = prefs;
         st.save()?;
     }
+    // grok 路径可能变了：作废版本探测缓存
+    config::invalidate_version_cache();
     // Apply shell preference to ACP TerminalHost immediately
     state.supervisor.sync_shell_from_prefs();
     {
@@ -62,7 +68,7 @@ pub fn update_prefs(state: State<'_, AppState>, prefs: DesktopPrefs) -> Result<D
 }
 
 #[tauri::command]
-pub fn set_onboarding_done(state: State<'_, AppState>, done: bool) -> Result<DesktopState, String> {
+pub async fn set_onboarding_done(state: State<'_, AppState>, done: bool) -> Result<DesktopState, String> {
     let mut st = state.desktop.lock();
     st.onboarding_done = done;
     st.save()?;
@@ -70,17 +76,17 @@ pub fn set_onboarding_done(state: State<'_, AppState>, done: bool) -> Result<Des
 }
 
 #[tauri::command]
-pub fn get_default_projects_dir(state: State<'_, AppState>) -> String {
+pub async fn get_default_projects_dir(state: State<'_, AppState>) -> Result<String, String> {
     let dir = state.desktop.lock().prefs.default_projects_dir.clone();
-    if dir.trim().is_empty() {
+    Ok(if dir.trim().is_empty() {
         r"D:\Grok Build".into()
     } else {
         dir
-    }
+    })
 }
 
 #[tauri::command]
-pub fn add_project(state: State<'_, AppState>, cwd: String) -> Result<DesktopState, String> {
+pub async fn add_project(state: State<'_, AppState>, cwd: String) -> Result<DesktopState, String> {
     let name = std::path::Path::new(&cwd)
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
@@ -104,7 +110,7 @@ pub fn add_project(state: State<'_, AppState>, cwd: String) -> Result<DesktopSta
 }
 
 #[tauri::command]
-pub fn remove_project(state: State<'_, AppState>, project_id: String) -> Result<DesktopState, String> {
+pub async fn remove_project(state: State<'_, AppState>, project_id: String) -> Result<DesktopState, String> {
     let mut st = state.desktop.lock();
     st.projects.retain(|p| p.id != project_id);
     st.sessions.retain(|s| s.project_id != project_id);
@@ -113,7 +119,7 @@ pub fn remove_project(state: State<'_, AppState>, project_id: String) -> Result<
 }
 
 #[tauri::command]
-pub fn open_config_file(state: State<'_, AppState>) -> Result<(), String> {
+pub async fn open_config_file(state: State<'_, AppState>) -> Result<(), String> {
     let path = paths::grok_config_toml();
     if !path.exists() {
         // create empty so editor opens
@@ -126,18 +132,18 @@ pub fn open_config_file(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn open_path(path: String) -> Result<(), String> {
+pub async fn open_path(path: String) -> Result<(), String> {
     config::open_path(&path)
 }
 
 #[tauri::command]
-pub fn open_in_editor(state: State<'_, AppState>, path: String) -> Result<(), String> {
+pub async fn open_in_editor(state: State<'_, AppState>, path: String) -> Result<(), String> {
     let editor = state.desktop.lock().prefs.default_editor.clone();
     config::open_in_editor(&editor, &path)
 }
 
 #[tauri::command]
-pub fn reveal_logs() -> Result<(), String> {
+pub async fn reveal_logs() -> Result<(), String> {
     paths::ensure_desktop_dirs().map_err(|e| e.to_string())?;
     config::open_path(&paths::desktop_logs_dir().display().to_string())
 }
@@ -170,7 +176,7 @@ pub async fn read_file(state: State<'_, AppState>, path: String) -> Result<Strin
 }
 
 #[tauri::command]
-pub fn app_info() -> Value {
+pub async fn app_info() -> Value {
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
@@ -192,7 +198,7 @@ pub fn app_info() -> Value {
 
 /// Open `%LOCALAPPDATA%\\GrokBuild\\installers` for manual NSIS installs.
 #[tauri::command]
-pub fn open_installers_dir() -> Result<String, String> {
+pub async fn open_installers_dir() -> Result<String, String> {
     let dir = paths::desktop_data_dir().join("installers");
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let s = dir.display().to_string();
@@ -219,8 +225,10 @@ pub async fn apply_diff(
 }
 
 #[tauri::command]
-pub fn reject_diff(path: String) -> diff_ops::ApplyDiffResult {
-    diff_ops::reject_diff(&path)
+pub async fn reject_diff(path: String) -> Result<diff_ops::ApplyDiffResult, String> {
+    tokio::task::spawn_blocking(move || diff_ops::reject_diff(&path))
+        .await
+        .map_err(|e| format!("reject join: {e}"))
 }
 
 #[tauri::command]
@@ -235,9 +243,11 @@ pub async fn export_diagnostics(state: State<'_, AppState>) -> Result<String, St
 }
 
 #[tauri::command]
-pub fn open_external_terminal(state: State<'_, AppState>, cwd: String) -> Result<(), String> {
+pub async fn open_external_terminal(state: State<'_, AppState>, cwd: String) -> Result<(), String> {
     let shell = state.desktop.lock().prefs.default_shell.clone();
-    open_terminal(&shell, &cwd)
+    tokio::task::spawn_blocking(move || open_terminal(&shell, &cwd))
+        .await
+        .map_err(|e| format!("terminal join: {e}"))?
 }
 
 /// Readonly Skills / MCP snapshot from ~/.grok (v0.3).
@@ -250,7 +260,7 @@ pub async fn list_skills_mcp() -> Result<crate::cli_caps::SkillsMcpSnapshot, Str
 
 /// Static capability flags for Settings UI.
 #[tauri::command]
-pub fn cli_capabilities() -> crate::cli_caps::CliCapabilities {
+pub async fn cli_capabilities() -> crate::cli_caps::CliCapabilities {
     crate::cli_caps::capabilities()
 }
 
@@ -258,7 +268,7 @@ pub fn cli_capabilities() -> crate::cli_caps::CliCapabilities {
 /// `level`: idle | running | needs_attention
 /// `focus_session_id`: optional session to open when user clicks the tray.
 #[tauri::command]
-pub fn update_tray_status(
+pub async fn update_tray_status(
     app: AppHandle,
     state: State<'_, AppState>,
     level: String,
@@ -326,7 +336,7 @@ pub fn update_tray_status(
 
 /// Focus main window (e.g. from toast / tray). Optionally emit session focus for UI.
 #[tauri::command]
-pub fn focus_main_window(
+pub async fn focus_main_window(
     app: AppHandle,
     state: State<'_, AppState>,
     session_id: Option<String>,

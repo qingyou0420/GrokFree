@@ -12,6 +12,8 @@ export function statusLabel(status: string | undefined | null): string {
       return "错误";
     case "hibernated":
       return "已休眠";
+    case "interrupted":
+      return "上轮中断";
     case "starting":
       return "启动中";
     case "pending":

@@ -10,11 +10,18 @@ export function usePermission(
   const [permission, setPermission] = useState<PermissionReq | null>(null);
 
   const respondPermission = useCallback(
-    async (allow: boolean, optionId?: string) => {
+    async (allow: boolean, optionId?: string, rememberSession?: boolean) => {
       if (!permission) return;
-      const { sessionId, id } = permission;
+      const { sessionId, id, scopeKey } = permission;
       try {
-        await api.respondPermission(sessionId, id, allow, optionId);
+        await api.respondPermission(
+          sessionId,
+          id,
+          allow,
+          optionId,
+          // 「本会话内允许」：把后端算好的 scope 回传做会话级缓存
+          rememberSession && allow ? scopeKey ?? null : null
+        );
         setPermission(null);
         onAfterRespond?.(sessionId);
       } catch (e) {

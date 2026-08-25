@@ -1,4 +1,4 @@
-/** Bottom prompt composer: input, send, stop */
+/** Bottom prompt composer: input, send/queue, stop */
 
 type Props = {
   activeSessionId: string | null;
@@ -6,7 +6,12 @@ type Props = {
   agentName?: string | null;
   input: string;
   setInput: (v: string) => void;
+  /** 仅创建/恢复中为真；轮次运行中输入框保持可用（消息进队列） */
   busy: boolean;
+  /** 本会话轮次运行中（发送变排队） */
+  turnRunning?: boolean;
+  /** 本会话排队待发送的消息数 */
+  queuedCount?: number;
   statusHint: string;
   showStop: boolean;
   onStop: () => void;
@@ -19,6 +24,8 @@ export function Composer({
   input,
   setInput,
   busy,
+  turnRunning,
+  queuedCount = 0,
   statusHint,
   showStop,
   onStop,
@@ -30,7 +37,9 @@ export function Composer({
         <textarea
           placeholder={
             activeSessionId
-              ? `向 ${agentName || "小精灵"} 发送消息… Enter 发送 · Shift+Enter 换行`
+              ? turnRunning
+                ? `小精灵正在执行…继续输入会排队，本轮结束后自动发送`
+                : `向 ${agentName || "小精灵"} 发送消息… Enter 发送 · Shift+Enter 换行`
               : "请先新建或恢复一个会话"
           }
           value={input}
@@ -51,6 +60,11 @@ export function Composer({
         />
         <div className="composer-bar">
           <span className="hint">{statusHint}</span>
+          {queuedCount > 0 && (
+            <span className="hint queue-chip" title="本轮结束后自动按序发送">
+              已排队 {queuedCount} 条
+            </span>
+          )}
           <span className="spacer" />
           {showStop && (
             <button
@@ -67,7 +81,7 @@ export function Composer({
             disabled={!activeSessionId || !input.trim() || busy}
             onClick={() => void onSend()}
           >
-            发送
+            {turnRunning ? "排队" : "发送"}
           </button>
         </div>
       </div>

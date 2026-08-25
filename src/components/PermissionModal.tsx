@@ -74,15 +74,38 @@ function summarizePermission(params: Record<string, unknown>) {
   return { title, kind, path, command, description, risk };
 }
 
+/** 从请求自带的 options 里挑「允许一次」的 optionId，避免猜 CLI 不认识的 id */
+function pickAllowOnceId(params: Record<string, unknown>): string {
+  const options = Array.isArray(params.options) ? params.options : [];
+  for (const raw of options) {
+    const opt = asRecord(raw);
+    if (!opt) continue;
+    const kind = String(opt.kind ?? "").toLowerCase().replace(/-/g, "_");
+    const oid = pickString(opt.optionId, opt.option_id, opt.id);
+    if (oid && (kind === "allow_once" || oid.toLowerCase() === "allow-once")) {
+      return oid;
+    }
+  }
+  for (const raw of options) {
+    const opt = asRecord(raw);
+    if (!opt) continue;
+    const oid = pickString(opt.optionId, opt.option_id, opt.id);
+    const l = (oid ?? "").toLowerCase();
+    if (oid && l.includes("allow") && !l.includes("always")) return oid;
+  }
+  return "allow-once";
+}
+
 export function PermissionModal({
   request,
   onRespond,
 }: {
   request: PermissionReq;
-  onRespond: (allow: boolean, optionId?: string) => void;
+  onRespond: (allow: boolean, optionId?: string, rememberSession?: boolean) => void;
 }) {
   const params = useMemo(() => request.params || {}, [request.params]);
   const summary = useMemo(() => summarizePermission(params), [params]);
+  const allowOnceId = useMemo(() => pickAllowOnceId(params), [params]);
   const [showRaw, setShowRaw] = useState(false);
 
   const riskLabel =
@@ -162,16 +185,21 @@ export function PermissionModal({
           <button
             type="button"
             className="btn"
-            onClick={() => onRespond(true, "allow-once")}
+            onClick={() => onRespond(true, allowOnceId)}
           >
             仅允许一次
           </button>
           <button
             type="button"
             className="btn primary"
-            onClick={() => onRespond(true, "allow-session")}
+            title={
+              request.scopeKey
+                ? `本会话内自动批准同类操作（${request.scopeKey}）`
+                : "本会话内自动批准同类操作"
+            }
+            onClick={() => onRespond(true, allowOnceId, true)}
           >
-            本会话允许
+            本会话内允许
           </button>
         </div>
       </div>

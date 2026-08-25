@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Default capabilities for GrokFree","local":true,"windows":["main"],"permissions":["core:default","core:event:default","core:window:default","core:app:default","core:path:default","shell:allow-open","dialog:default","notification:default"]}}

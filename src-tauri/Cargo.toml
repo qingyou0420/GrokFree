@@ -1,0 +1,56 @@
+[package]
+name = "grokfree"
+version = "0.9.0"
+description = "GrokFree — multi-agent command center over ACP"
+authors = ["GrokFree"]
+edition = "2021"
+
+[lib]
+name = "grokfree_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "protocol-asset"] }
+tauri-plugin-shell = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-notification = "2"
+tauri-plugin-single-instance = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+dirs = "6"
+chrono = { version = "0.4", features = ["serde"] }
+parking_lot = "0.12"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking", "stream"] }
+futures-util = "0.3"
+
+# Production builds MUST enable custom-protocol so the WebView loads embedded
+# frontend assets instead of http://localhost:1420 (which fails with
+# "localhost refused connection" when the Vite dev server is not running).
+# `tauri dev` uses --no-default-features to talk to the live Vite server.
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_JobObjects",
+  "Win32_System_Threading",
+] }

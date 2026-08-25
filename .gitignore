@@ -1,0 +1,13 @@
+node_modules/
+dist/
+src-tauri/target/
+*.log
+.DS_Store
+Thumbs.db
+Desktop.ini
+.env
+.env.*
+_archive_electron_v0/
+.workbuddy/
+docs/REVIEW-*.md
+docs/UI-REVIEW-*.md

@@ -8,11 +8,14 @@ mod diagnostics;
 mod diff_ops;
 mod git_ops;
 mod job_object;
+mod journal;
 mod paths;
 mod process_util;
+mod session_fsm;
 mod sessions_disk;
 mod supervisor;
 mod terminal;
+mod turn_lease;
 mod workspace;
 
 use commands::AppState;
@@ -33,6 +36,17 @@ pub fn run() {
     init_logging();
 
     let desktop = Arc::new(StdMutex::new(DesktopState::load()));
+    // 启动修复（turn lease）：上次运行中未收尾的轮次 → 会话标 interrupted +
+    // 自有日志追加说明；meta 里残留的 running/waiting_permission 归一化。
+    // 事件循环还没起，这里的少量小文件 IO 不影响窗口。
+    {
+        let mut st = desktop.lock();
+        let repaired = turn_lease::repair_on_startup(&mut st);
+        if repaired > 0 {
+            tracing::warn!("启动修复：{repaired} 个会话上轮被中断（已标记 interrupted）");
+        }
+        let _ = st.save();
+    }
     // 旧 prefs.model 曾驱动 grok 会话；现在会话模型只看档案 defaultModel。
     // 首次启动把旧值并入 grok 档案。
     {
@@ -179,6 +193,8 @@ pub fn run() {
             commands::disk::delete_disk_session,
             commands::disk::rename_session,
             commands::disk::remove_session_meta,
+            commands::disk::load_journal,
+            commands::disk::save_journal,
             commands::disk::purge_stale_session_meta,
             commands::update::check_cloud_update,
             commands::update::launch_cloud_update,

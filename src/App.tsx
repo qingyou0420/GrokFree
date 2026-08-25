@@ -24,6 +24,7 @@ import { Sidebar } from "./components/Sidebar";
 import { ToastStack } from "./components/ToastStack";
 import { Topbar } from "./components/Topbar";
 import { api, errorText } from "./lib/api";
+import { initJournalSync } from "./lib/journalSync";
 import { isPlaceholderTitle, latestPlan, scrubTranscript } from "./lib/acp-parse";
 import { applyTheme } from "./lib/theme";
 import { statusLabel } from "./lib/i18n";
@@ -544,6 +545,8 @@ export default function App() {
   useEffect(() => {
     if (booted.current) return;
     booted.current = true;
+    // 自有日志节流落盘（≥500ms；实时事件为真值，CLI 历史降级为兜底）
+    initJournalSync();
     refresh().catch((e) => flash(String(e), "error"));
     void refreshAgents();
   }, [refresh, flash, refreshAgents]);

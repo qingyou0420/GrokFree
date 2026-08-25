@@ -203,6 +203,23 @@ export function useSessionActions(opts: {
       pathHint?: string | null,
       banner?: string
     ) => {
+      // 自有日志优先（实时事件的落盘快照，格式由我们掌控）；
+      // 无日志（旧会话 / 首次磁盘恢复）才退回 CLI chat_history 解析。
+      // 日志路径不插 banner 块：banner 会被落盘，反复恢复会越积越多。
+      try {
+        const journal = await api.loadJournal(desktopSessionId).catch(() => null);
+        if (journal && journal.length > 0) {
+          setTranscripts((prev) => ({ ...prev, [desktopSessionId]: journal }));
+          setHistoryTail((prev) => ({
+            ...prev,
+            [desktopSessionId]: normalizeHistoryInitial(prefsRef.current),
+          }));
+          revealChatAfterPaint(desktopSessionId);
+          return;
+        }
+      } catch {
+        /* 日志读取失败按无日志处理 */
+      }
       try {
         const hist = await api.loadDiskTranscript(grokSessionId, pathHint);
         const emptySys =

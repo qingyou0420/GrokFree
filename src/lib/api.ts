@@ -77,6 +77,12 @@ export const api = {
     }),
   renameSession: (sessionId: string, title: string) =>
     invoke<DesktopState>("rename_session", { sessionId, title }),
+  /** 自有会话日志：读取快照（无日志返回 null，退回 CLI 历史） */
+  loadJournal: (sessionId: string) =>
+    invoke<ChatBlock[] | null>("load_journal", { sessionId }),
+  /** 自有会话日志：保存快照（journalSync 节流后调用） */
+  saveJournal: (sessionId: string, blocks: ChatBlock[]) =>
+    invoke<void>("save_journal", { sessionId, blocks }),
   removeSessionMeta: (sessionId: string) =>
     invoke<DesktopState>("remove_session_meta", { sessionId }),
   purgeStaleSessionMeta: (projectId?: string | null) =>

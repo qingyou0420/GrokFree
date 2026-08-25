@@ -3,7 +3,9 @@
 use crate::acp::{AcpClient, AcpEvent};
 use crate::config::{DesktopPrefs, DesktopState, SessionMeta};
 use crate::paths;
+use crate::session_fsm::{self as fsm, Event as FsmEvent};
 use crate::terminal::TerminalHost;
+use crate::turn_lease;
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use parking_lot::Mutex as StdMutex;
@@ -559,13 +561,13 @@ impl Supervisor {
                 .get_mut(session_id)
                 .ok_or_else(|| anyhow!("会话不存在或已休眠：{session_id}"))?;
             // 后端真值门禁：全局 busy 取消后由这里防并发 prompt
-            if rt.meta.status == "running" {
+            if rt.meta.status == fsm::status::RUNNING {
                 return Err(anyhow!("会话正在执行中，请等待本轮完成或先「停止」"));
             }
-            if rt.meta.status == "waiting_permission" {
+            if rt.meta.status == fsm::status::WAITING_PERMISSION {
                 return Err(anyhow!("会话正在等待授权，请先处理授权请求"));
             }
-            rt.meta.status = "running".into();
+            rt.meta.status = fsm::transition(&rt.meta.status, FsmEvent::PromptStart).into();
             rt.meta.error = None;
             // 静默看门狗按轮武装
             let now = std::time::Instant::now();
@@ -588,7 +590,33 @@ impl Supervisor {
             (sid, client)
         };
 
+        // 轮次磁盘租约：宿主中途死亡时，下次启动能把该会话标 interrupted
+        // 而不是看起来"干净结束"。文件极小，仍走 spawn_blocking 不占 worker。
+        {
+            let (sid, gsid, title, cmd) = (
+                session_id.to_string(),
+                grok_sid.clone(),
+                {
+                    let map = self.sessions.lock().await;
+                    map.get(session_id)
+                        .map(|rt| rt.meta.title.clone())
+                        .unwrap_or_default()
+                },
+                text.to_string(),
+            );
+            let _ = tokio::task::spawn_blocking(move || {
+                turn_lease::write_lease(&sid, Some(&gsid), &title, &cmd);
+            })
+            .await;
+        }
+
         let result = client.prompt(&grok_sid, text).await;
+
+        // 轮次收尾（成败皆然）：清租约
+        {
+            let sid = session_id.to_string();
+            let _ = tokio::task::spawn_blocking(move || turn_lease::clear_lease(&sid)).await;
+        }
 
         let mut map = self.sessions.lock().await;
         if let Some(rt) = map.get_mut(session_id) {
@@ -596,10 +624,11 @@ impl Supervisor {
             rt.last_activity = std::time::Instant::now();
             match &result {
                 Ok(_) => {
-                    rt.meta.status = "idle".into();
+                    rt.meta.status = fsm::transition(&rt.meta.status, FsmEvent::PromptOk).into();
                 }
                 Err(e) => {
-                    rt.meta.status = "error".into();
+                    rt.meta.status =
+                        fsm::transition(&rt.meta.status, FsmEvent::PromptErr).into();
                     rt.meta.error = Some(e.to_string());
                 }
             }
@@ -663,11 +692,15 @@ impl Supervisor {
 
         let mut map = self.sessions.lock().await;
         if let Some(rt) = map.get_mut(session_id) {
-            rt.meta.status = if allow {
-                "running".into()
-            } else {
-                "idle".into()
-            };
+            rt.meta.status = fsm::transition(
+                &rt.meta.status,
+                if allow {
+                    FsmEvent::PermissionAllow
+                } else {
+                    FsmEvent::PermissionDeny
+                },
+            )
+            .into();
             // 授权应答 = 轮次继续推进：重置静默计时
             let now = std::time::Instant::now();
             rt.last_stream_at = now;
@@ -893,11 +926,11 @@ impl Supervisor {
             if let Some(client) = rt.client.take() {
                 let _ = client.kill().await;
             }
-            rt.meta.status = "hibernated".into();
+            rt.meta.status = fsm::transition(&rt.meta.status, FsmEvent::Hibernate).into();
             let _ = app.emit("agent://state", &rt.meta);
             let mut st = self.state.lock();
             if let Some(s) = st.sessions.iter_mut().find(|s| s.id == session_id) {
-                s.status = "hibernated".into();
+                s.status = fsm::status::HIBERNATED.into();
                 s.last_active_at = Utc::now().to_rfc3339();
             }
             let _ = st.save();
@@ -914,7 +947,7 @@ impl Supervisor {
                 let count = map.len();
                 let oldest = map
                     .values()
-                    .filter(|rt| matches!(rt.meta.status.as_str(), "idle" | "error"))
+                    .filter(|rt| fsm::is_reclaimable(&rt.meta.status))
                     .min_by_key(|rt| rt.last_activity)
                     .map(|rt| rt.meta.id.clone());
                 (count, oldest)
@@ -958,11 +991,12 @@ impl Supervisor {
         {
             let mut map = self.sessions.lock().await;
             for rt in map.values_mut() {
-                if rt.meta.status != "running" {
+                if rt.meta.status != fsm::status::RUNNING {
                     continue;
                 }
                 if !rt.prompt_inflight {
-                    rt.meta.status = "idle".into();
+                    rt.meta.status =
+                        fsm::transition(&rt.meta.status, FsmEvent::StallHeal).into();
                     heal.push(rt.meta.clone());
                     continue;
                 }
@@ -1026,7 +1060,7 @@ impl Supervisor {
             let map = self.sessions.lock().await;
             map.values()
                 .filter(|rt| {
-                    matches!(rt.meta.status.as_str(), "idle" | "error")
+                    fsm::is_reclaimable(&rt.meta.status)
                         && rt.last_activity.elapsed().as_secs() >= IDLE_HIBERNATE_SECS
                 })
                 .map(|rt| rt.meta.id.clone())
@@ -1069,7 +1103,8 @@ impl Supervisor {
             if !rt.allow_scopes.contains(&scope) {
                 return false;
             }
-            rt.meta.status = "running".into();
+            rt.meta.status =
+                fsm::transition(&rt.meta.status, FsmEvent::PermissionAllow).into();
             rt.last_stream_at = std::time::Instant::now();
             rt.stall_notified = false;
             let _ = app.emit("agent://state", &rt.meta);
@@ -1115,7 +1150,7 @@ impl Supervisor {
             map.values()
                 .filter(|rt| {
                     rt.meta.project_id != active_project_id
-                        && matches!(rt.meta.status.as_str(), "idle" | "error")
+                        && fsm::is_reclaimable(&rt.meta.status)
                 })
                 .map(|rt| rt.meta.id.clone())
                 .collect()
@@ -1162,8 +1197,9 @@ impl Supervisor {
                 return;
             }
             rt.client = None;
-            rt.meta.status = "error".into();
+            rt.meta.status = fsm::transition(&rt.meta.status, FsmEvent::AgentExited).into();
             rt.meta.error = Some(format!("Agent 进程已退出：{code:?}"));
+            rt.prompt_inflight = false;
             let _ = app.emit("agent://state", &rt.meta);
         }
     }
@@ -1172,6 +1208,17 @@ impl Supervisor {
         let mut map = self.sessions.lock().await;
         if let Some(rt) = map.get_mut(session_id) {
             rt.meta.status = status.into();
+            let _ = app.emit("agent://state", &rt.meta);
+        }
+    }
+
+    /// 收到 `session/request_permission`：状态机进入 waiting_permission。
+    pub async fn mark_waiting_permission(&self, app: &AppHandle, session_id: &str) {
+        let mut map = self.sessions.lock().await;
+        if let Some(rt) = map.get_mut(session_id) {
+            rt.meta.status =
+                fsm::transition(&rt.meta.status, FsmEvent::PermissionRequest).into();
+            rt.last_activity = std::time::Instant::now();
             let _ = app.emit("agent://state", &rt.meta);
         }
     }
@@ -1318,13 +1365,14 @@ async fn handle_immediate_event(
                         "scopeKey": permission_scope_key(&params)
                     }),
                 );
-                let _ = app.emit(
-                    "agent://state",
-                    json!({
-                        "id": desktop_session_id,
-                        "status": "waiting_permission"
-                    }),
-                );
+                // Rust 侧也进入 waiting_permission：状态机真值在宿主，
+                // 前端只投影快照（此前仅发事件，后端 meta 一直停在 running）
+                if let Some(state) = app.try_state::<crate::commands::AppState>() {
+                    state
+                        .supervisor
+                        .mark_waiting_permission(app, desktop_session_id)
+                        .await;
+                }
                 return;
             }
 

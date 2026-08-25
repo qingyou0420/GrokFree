@@ -82,10 +82,41 @@ pub async fn remove_session_meta(
     state: State<'_, AppState>,
     session_id: String,
 ) -> Result<DesktopState, String> {
-    let mut st = state.desktop.lock();
-    st.sessions.retain(|s| s.id != session_id);
-    st.save()?;
-    Ok(st.clone())
+    let snapshot = {
+        let mut st = state.desktop.lock();
+        st.sessions.retain(|s| s.id != session_id);
+        st.save()?;
+        st.clone()
+    };
+    // 连带清理自有日志与残留租约（锁外、worker 线程）
+    let sid = session_id.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        crate::journal::delete_journal(&sid);
+        crate::turn_lease::clear_lease(&sid);
+    })
+    .await;
+    Ok(snapshot)
+}
+
+/// 自有会话日志：读取（日志优先水合；无日志时前端退回 CLI 历史解析）。
+#[tauri::command]
+pub async fn load_journal(
+    session_id: String,
+) -> Result<Option<Vec<serde_json::Value>>, String> {
+    tokio::task::spawn_blocking(move || crate::journal::load_journal(&session_id))
+        .await
+        .map_err(|e| format!("journal join: {e}"))
+}
+
+/// 自有会话日志：保存 transcript 快照（前端 ≥500ms 节流后调用）。
+#[tauri::command]
+pub async fn save_journal(
+    session_id: String,
+    blocks: serde_json::Value,
+) -> Result<(), String> {
+    tokio::task::spawn_blocking(move || crate::journal::save_journal(&session_id, &blocks))
+        .await
+        .map_err(|e| format!("journal join: {e}"))?
 }
 
 /// Remove project-list meta entries that look like empty / placeholder sessions

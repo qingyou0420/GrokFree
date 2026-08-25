@@ -91,14 +91,22 @@ export const api = {
     sessionId: string,
     requestId: unknown,
     allow: boolean,
-    optionId?: string
+    optionId?: string,
+    rememberScope?: string | null
   ) =>
     invoke<void>("respond_permission", {
       sessionId,
       requestId,
       allow,
       optionId: optionId ?? null,
+      rememberScope: rememberScope ?? null,
     }),
+  /** 静默提示「继续等待」：重置该会话的静默计时 */
+  stallKeepWaiting: (sessionId: string) =>
+    invoke<void>("stall_keep_waiting", { sessionId }),
+  /** 取消在途的会话启动/恢复（杀 initialize/load 中的进程） */
+  cancelStart: (sessionId: string) =>
+    invoke<void>("cancel_start", { sessionId }),
   handleServerRequest: (
     sessionId: string,
     requestId: unknown,

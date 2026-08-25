@@ -2597,3 +2597,47 @@ details.tool-card > summary.tool-card-summary {
 details.tool-card > summary.tool-card-summary::-webkit-details-marker {
   display: none;
 }
+
+/* —— 静默看门狗提示条（继续等待 / 结束本轮，不自动取消） */
+.stall-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 12px 6px;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid color-mix(in srgb, var(--warning) 40%, transparent);
+  background: rgba(184, 122, 10, 0.08);
+  color: var(--warning);
+  font-size: 12.5px;
+}
+.stall-banner .spacer {
+  flex: 1;
+}
+
+/* —— 恢复会话进行中（可取消） */
+.resume-banner {
+  position: fixed;
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 14px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--bg-elevated, var(--bg));
+  box-shadow: var(--shadow-md);
+  font-size: 12.5px;
+}
+
+/* —— 忙时排队计数（composer 状态栏） */
+.queue-chip {
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  background: var(--accent-soft);
+  color: var(--accent);
+}

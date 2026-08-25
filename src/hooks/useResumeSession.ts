@@ -1,4 +1,4 @@
-import { useCallback, useRef, type MutableRefObject } from "react";
+import { useCallback, useRef, useState, type MutableRefObject } from "react";
 import { api } from "../lib/api";
 import type { DiskSession, LiveSession, Project } from "../lib/types";
 
@@ -47,6 +47,10 @@ export function useResumeSession(opts: {
 }) {
   const ownInFlight = useRef(false);
   const inFlight = opts.inFlightRef ?? ownInFlight;
+  /** 在途恢复（App 用它渲染「取消恢复」按钮，cancel_start 杀在途进程） */
+  const [resuming, setResuming] = useState<{ id: string; title: string } | null>(
+    null
+  );
 
   const resumeMeta = useCallback(
     async (meta: {
@@ -69,6 +73,7 @@ export function useResumeSession(opts: {
       opts.onBeforeResume?.();
       opts.setBusy(true);
       opts.setShowDashboard(false);
+      setResuming({ id: meta.id, title: meta.title });
       try {
         let pathHint: string | null = null;
         try {
@@ -105,6 +110,7 @@ export function useResumeSession(opts: {
       } finally {
         inFlight.current = false;
         opts.setBusy(false);
+        setResuming(null);
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional opts bag
@@ -136,15 +142,17 @@ export function useResumeSession(opts: {
         return;
       }
       const cwdUse = d.cwd || project.cwd;
+      const desktopSessionId = uid("desk");
       inFlight.current = true;
       opts.onBeforeResume?.();
       opts.setBusy(true);
       opts.setShowDiskHistory(false);
       opts.setShowDashboard(false);
+      setResuming({ id: desktopSessionId, title: d.title || d.id });
       try {
         // 磁盘历史即 ~/.grok/sessions，只有 grok 档案能恢复
         const session = await api.resumeSession({
-          desktopSessionId: uid("desk"),
+          desktopSessionId,
           grokSessionId: d.id,
           projectId: project.id,
           cwd: cwdUse,
@@ -173,11 +181,12 @@ export function useResumeSession(opts: {
       } finally {
         inFlight.current = false;
         opts.setBusy(false);
+        setResuming(null);
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [opts.busy, opts.projects, opts.activeProject, opts.loadTranscriptForSession, inFlight]
   );
 
-  return { resumeMeta, resumeDiskSession, resumeInFlightRef: inFlight };
+  return { resumeMeta, resumeDiskSession, resumeInFlightRef: inFlight, resuming };
 }

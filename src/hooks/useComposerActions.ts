@@ -1,6 +1,7 @@
 import { useCallback, useState } from "react";
 import { api } from "../lib/api";
 import { useSessionStore } from "../state";
+import { SEND_QUEUE_MAX } from "../state/sessionStore";
 
 type Flash = (
   text: string,
@@ -30,16 +31,26 @@ export function useComposerActions(opts: {
 
   const sendPrompt = useCallback(async () => {
     const text = input.trim();
-    const { activeSessionId, live } = useSessionStore.getState();
+    const { activeSessionId, live, enqueueSend } = useSessionStore.getState();
     if (!text || !activeSessionId) return;
-    // 按会话门禁：本会话在忙才拦，不影响其他会话/项目的操作
+    // 忙时排队（借鉴 grok-app send queue）：本会话在忙不再拦下消息，
+    // 入队并在本轮结束后自动按序发送。不引入全局 busy。
     const cur = live.find((s) => s.id === activeSessionId);
-    if (cur && cur.status === "running") {
-      flash("本会话正在执行，请等待完成或点「停止」", "info", activeSessionId);
-      return;
-    }
-    if (cur && cur.status === "waiting_permission") {
-      flash("请先处理本会话的授权请求", "info", activeSessionId);
+    if (
+      cur &&
+      (cur.status === "running" || cur.status === "waiting_permission")
+    ) {
+      const n = enqueueSend(activeSessionId, text);
+      if (n < 0) {
+        flash(
+          `排队已满（${SEND_QUEUE_MAX} 条），请等待本轮结束`,
+          "error",
+          activeSessionId
+        );
+        return;
+      }
+      setInput("");
+      flash(`已排队（${n} 条待发送），本轮结束后自动发送`, "info", activeSessionId);
       return;
     }
     setInput("");

@@ -285,8 +285,14 @@ impl AcpClient {
     }
 
     pub async fn cancel(&self, session_id: &str) -> Result<Value> {
+        // 短超时：CLI 真挂死时不能让「停止/结束本轮」自己也挂 10 分钟，
+        // 快速退回通知式 cancel（fire-and-forget）。
         match self
-            .request("session/cancel", json!({ "sessionId": session_id }))
+            .request_with_timeout(
+                "session/cancel",
+                json!({ "sessionId": session_id }),
+                std::time::Duration::from_secs(5),
+            )
             .await
         {
             Ok(v) => Ok(v),

@@ -89,7 +89,13 @@ pub fn run() {
             supervisor: supervisor.clone(),
             focus_session: Arc::new(StdMutex::new(None)),
         })
-        .setup(|app| {
+        .setup(move |app| {
+            // 后台看门狗：流静默提示（不自动取消）+ 闲置进程回收
+            supervisor::spawn_watchdog(
+                app.handle().clone(),
+                app.state::<AppState>().supervisor.clone(),
+            );
+
             // System tray
             let show_i = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
             let focus_i =
@@ -158,6 +164,8 @@ pub fn run() {
             commands::session::handle_server_request,
             commands::session::hibernate_session,
             commands::session::set_active_project,
+            commands::session::stall_keep_waiting,
+            commands::session::cancel_start,
             commands::open_config_file,
             commands::open_path,
             commands::open_in_editor,

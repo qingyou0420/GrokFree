@@ -218,6 +218,8 @@ export type PermissionReq = {
   id: unknown;
   method: string;
   params: Record<string, unknown>;
+  /** 后端计算的权限范围键（「本会话内允许」按此聚类缓存） */
+  scopeKey?: string;
 };
 
 export type ToastState = {

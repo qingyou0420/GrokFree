@@ -40,7 +40,47 @@ struct SessionRuntime {
     /// Instance id of `client`; guards against stale `Exited` events from a
     /// replaced client overwriting the state of the new one.
     client_gen: u64,
+    /// 最近一次生命周期活动（发送/应答/流式输出）。闲置回收依据。
+    last_activity: std::time::Instant,
+    /// 最近一次流式进展（token / 工具事件）。静默看门狗依据。
+    last_stream_at: std::time::Instant,
+    /// `session/prompt` 是否在途。RPC 已结束但状态仍 running → 无声自愈。
+    prompt_inflight: bool,
+    /// 本轮是否产生过任何 token / 工具事件（无输出轮次用更短静默阈值）。
+    turn_had_activity: bool,
+    /// 本轮已弹过「继续等待 / 结束本轮」，避免重复提示（继续等待后重置）。
+    stall_notified: bool,
+    /// 「本会话内允许」的权限范围缓存（scope key，见 permission_scope_key）。
+    allow_scopes: std::collections::HashSet<String>,
 }
+
+impl SessionRuntime {
+    fn new(meta: LiveSession, client: Arc<AcpClient>) -> Self {
+        let now = std::time::Instant::now();
+        let client_gen = client.instance_id();
+        Self {
+            meta,
+            client: Some(client),
+            client_gen,
+            last_activity: now,
+            last_stream_at: now,
+            prompt_inflight: false,
+            turn_had_activity: false,
+            stall_notified: false,
+            allow_scopes: std::collections::HashSet::new(),
+        }
+    }
+}
+
+/// 借鉴 grok-app 的进程治理默认值（process_limits）：
+/// 活跃 agent 进程上限；超限时先回收最旧的空闲会话，全忙则拒绝新建。
+const MAX_CONCURRENT_AGENTS: usize = 8;
+/// 空闲（idle/error）超过该时长自动休眠（meta 保留，一键恢复）。
+const IDLE_HIBERNATE_SECS: u64 = 30 * 60;
+/// 流静默看门狗：本轮有过输出后允许的纯静默时长（工具常安静数分钟）。
+const STALL_SILENCE_SECS: u64 = 300;
+/// 本轮从未产生 token/工具事件时的静默阈值（挂死的 prompt 应更早提示）。
+const STALL_SILENCE_NO_OUTPUT_SECS: u64 = 120;
 
 pub struct Supervisor {
     sessions: Mutex<HashMap<String, SessionRuntime>>,
@@ -55,6 +95,9 @@ pub struct Supervisor {
     /// Rejects duplicate starts (double-click / impatient re-click) instead of
     /// stacking processes.
     starting: StdMutex<std::collections::HashSet<String>>,
+    /// Spawn 已成功但 initialize/session-load 还在途的 client（按桌面会话 id）。
+    /// 「取消恢复」由此杀掉在途进程；成功/失败后由 RAII 守卫移除。
+    pending_spawns: Arc<StdMutex<HashMap<String, Arc<AcpClient>>>>,
 }
 
 /// RAII: removes the start-guard key when the create/resume attempt ends.
@@ -66,6 +109,29 @@ struct StartGuard<'a> {
 impl Drop for StartGuard<'_> {
     fn drop(&mut self) {
         self.set.lock().remove(&self.key);
+    }
+}
+
+/// RAII: exposes an in-flight spawn's client for「取消恢复」, removed on drop.
+struct PendingSpawnGuard {
+    map: Arc<StdMutex<HashMap<String, Arc<AcpClient>>>>,
+    key: String,
+}
+
+impl PendingSpawnGuard {
+    fn register(
+        map: Arc<StdMutex<HashMap<String, Arc<AcpClient>>>>,
+        key: String,
+        client: Arc<AcpClient>,
+    ) -> Self {
+        map.lock().insert(key.clone(), client);
+        Self { map, key }
+    }
+}
+
+impl Drop for PendingSpawnGuard {
+    fn drop(&mut self) {
+        self.map.lock().remove(&self.key);
     }
 }
 
@@ -83,6 +149,7 @@ impl Supervisor {
             terminals,
             spawn_gate: Mutex::new(()),
             starting: StdMutex::new(std::collections::HashSet::new()),
+            pending_spawns: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -147,6 +214,8 @@ impl Supervisor {
             ));
         }
 
+        self.ensure_capacity(&app).await?;
+
         let (client, grok_sid) = self
             .spawn_agent(&app, &id, &cwd, &prefs, None, &agent_id)
             .await?;
@@ -166,14 +235,7 @@ impl Supervisor {
 
         {
             let mut map = self.sessions.lock().await;
-            map.insert(
-                id.clone(),
-                SessionRuntime {
-                    meta: live.clone(),
-                    client: Some(client.clone()),
-                    client_gen: client.instance_id(),
-                },
-            );
+            map.insert(id.clone(), SessionRuntime::new(live.clone(), client.clone()));
         }
 
         {
@@ -249,6 +311,8 @@ impl Supervisor {
             ));
         }
 
+        self.ensure_capacity(&app).await?;
+
         let prefs = self.state.lock().prefs.clone();
         let agent_id = agent_id.unwrap_or_else(|| crate::agents::DEFAULT_AGENT_ID.into());
         let (kept_delegated, kept_job) = {
@@ -287,11 +351,7 @@ impl Supervisor {
             let mut map = self.sessions.lock().await;
             map.insert(
                 desktop_session_id.clone(),
-                SessionRuntime {
-                    meta: live.clone(),
-                    client: Some(client.clone()),
-                    client_gen: client.instance_id(),
-                },
+                SessionRuntime::new(live.clone(), client.clone()),
             );
         }
 
@@ -420,6 +480,13 @@ impl Supervisor {
         let spec = crate::agents::build_spawn(profile, &model, always, &grok_exe);
         let client = AcpClient::spawn(&spec, PathBuf::from(cwd).as_path(), event_tx).await?;
 
+        // 注册在途 spawn：「取消恢复」可据此杀进程；RAII 守卫返回时移除
+        let _pending = PendingSpawnGuard::register(
+            self.pending_spawns.clone(),
+            desktop_session_id.to_string(),
+            client.clone(),
+        );
+
         // 每个失败路径都显式 kill：kill_on_drop / Job Object 是兜底，
         // 显式杀死让「启动失败」立即回收进程树，而不是等 Arc 引用归零。
         if let Err(e) = client.initialize().await {
@@ -500,6 +567,13 @@ impl Supervisor {
             }
             rt.meta.status = "running".into();
             rt.meta.error = None;
+            // 静默看门狗按轮武装
+            let now = std::time::Instant::now();
+            rt.prompt_inflight = true;
+            rt.turn_had_activity = false;
+            rt.stall_notified = false;
+            rt.last_stream_at = now;
+            rt.last_activity = now;
             let _ = app.emit("agent://state", &rt.meta);
             let sid = rt
                 .meta
@@ -518,6 +592,8 @@ impl Supervisor {
 
         let mut map = self.sessions.lock().await;
         if let Some(rt) = map.get_mut(session_id) {
+            rt.prompt_inflight = false;
+            rt.last_activity = std::time::Instant::now();
             match &result {
                 Ok(_) => {
                     rt.meta.status = "idle".into();
@@ -561,6 +637,7 @@ impl Supervisor {
         request_id: Value,
         allow: bool,
         option_id: Option<String>,
+        remember_scope: Option<String>,
     ) -> Result<()> {
         let client = {
             let map = self.sessions.lock().await;
@@ -591,6 +668,18 @@ impl Supervisor {
             } else {
                 "idle".into()
             };
+            // 授权应答 = 轮次继续推进：重置静默计时
+            let now = std::time::Instant::now();
+            rt.last_stream_at = now;
+            rt.last_activity = now;
+            rt.stall_notified = false;
+            // 「本会话内允许」：记住范围，后续同类请求自动批准
+            if allow {
+                if let Some(scope) = remember_scope.filter(|s| !s.trim().is_empty()) {
+                    tracing::info!("会话 {session_id} 记住权限范围：{scope}");
+                    rt.allow_scopes.insert(scope);
+                }
+            }
             let _ = app.emit("agent://state", &rt.meta);
         }
         Ok(())
@@ -816,6 +905,203 @@ impl Supervisor {
         Ok(())
     }
 
+    /// 进程上限（借鉴 grok-app I02）：满员时先回收最旧的空闲/出错会话；
+    /// 全部在忙（running / waiting_permission）则拒绝——**绝不杀忙轮次**。
+    async fn ensure_capacity(&self, app: &AppHandle) -> Result<()> {
+        for _ in 0..MAX_CONCURRENT_AGENTS + 1 {
+            let (count, oldest_idle) = {
+                let map = self.sessions.lock().await;
+                let count = map.len();
+                let oldest = map
+                    .values()
+                    .filter(|rt| matches!(rt.meta.status.as_str(), "idle" | "error"))
+                    .min_by_key(|rt| rt.last_activity)
+                    .map(|rt| rt.meta.id.clone());
+                (count, oldest)
+            };
+            if count < MAX_CONCURRENT_AGENTS {
+                return Ok(());
+            }
+            let Some(victim) = oldest_idle else {
+                return Err(anyhow!(
+                    "已达并发上限（{MAX_CONCURRENT_AGENTS} 个活跃小精灵，且全部在忙）。请等待任务完成或手动休眠。"
+                ));
+            };
+            tracing::info!("进程上限：回收最旧空闲会话 {victim}");
+            let _ = self.hibernate(app.clone(), &victim).await;
+        }
+        Ok(())
+    }
+
+    /// 事件转发器：该会话有流式进展（token / 工具事件）。
+    /// 喂给闲置回收与静默看门狗；按合批粒度调用（≤25 次/秒/会话）。
+    pub async fn note_stream_activity(&self, session_id: &str) {
+        let mut map = self.sessions.lock().await;
+        if let Some(rt) = map.get_mut(session_id) {
+            let now = std::time::Instant::now();
+            rt.last_stream_at = now;
+            rt.last_activity = now;
+            rt.turn_had_activity = true;
+            rt.stall_notified = false;
+        }
+    }
+
+    /// 静默看门狗（借鉴 grok-app stream_stall / tool_heartbeat）：
+    /// 1. 无声自愈：状态 running 但 prompt RPC 已结束 → 拨回 idle；
+    /// 2. 长工具心跳的等价物：会话还有存活的 ACP 终端 → 视为在干活，重新武装；
+    /// 3. 纯静默超阈值 → 弹「继续等待 / 结束本轮」（agent://stall）。
+    ///    **绝不自动取消**用户发起的轮次，只提示。
+    pub async fn stall_check(&self, app: &AppHandle) {
+        // 收集待办再逐个处理，锁内不做 IO / emit
+        let mut heal: Vec<LiveSession> = Vec::new();
+        let mut maybe_stalled: Vec<(String, String, u64)> = Vec::new();
+        {
+            let mut map = self.sessions.lock().await;
+            for rt in map.values_mut() {
+                if rt.meta.status != "running" {
+                    continue;
+                }
+                if !rt.prompt_inflight {
+                    rt.meta.status = "idle".into();
+                    heal.push(rt.meta.clone());
+                    continue;
+                }
+                if rt.stall_notified {
+                    continue;
+                }
+                let threshold = if rt.turn_had_activity {
+                    STALL_SILENCE_SECS
+                } else {
+                    STALL_SILENCE_NO_OUTPUT_SECS
+                };
+                let silent = rt.last_stream_at.elapsed().as_secs();
+                if silent >= threshold {
+                    maybe_stalled.push((rt.meta.id.clone(), rt.meta.title.clone(), silent));
+                }
+            }
+        }
+        for meta in heal {
+            tracing::info!("无声自愈：会话 {} RPC 已结束但状态残留 running", meta.id);
+            let _ = app.emit("agent://state", &meta);
+        }
+        for (id, title, silent) in maybe_stalled {
+            // 有存活终端 = 长工具还在跑：重新武装，不算失速
+            if self.terminals.session_has_running(&id).await {
+                let mut map = self.sessions.lock().await;
+                if let Some(rt) = map.get_mut(&id) {
+                    rt.last_stream_at = std::time::Instant::now();
+                }
+                continue;
+            }
+            {
+                let mut map = self.sessions.lock().await;
+                match map.get_mut(&id) {
+                    Some(rt) if rt.meta.status == "running" && !rt.stall_notified => {
+                        rt.stall_notified = true;
+                    }
+                    _ => continue,
+                }
+            }
+            tracing::warn!("会话 {id} 静默 {silent}s，提示用户（不自动取消）");
+            let _ = app.emit(
+                "agent://stall",
+                json!({ "sessionId": id, "title": title, "silentSecs": silent }),
+            );
+        }
+    }
+
+    /// 「继续等待」：重置静默计时，允许下一轮提示。
+    pub async fn stall_keep_waiting(&self, session_id: &str) {
+        let mut map = self.sessions.lock().await;
+        if let Some(rt) = map.get_mut(session_id) {
+            rt.last_stream_at = std::time::Instant::now();
+            rt.stall_notified = false;
+        }
+    }
+
+    /// 闲置回收（借鉴 grok-app I03）：空闲/出错超 30 分钟自动休眠。
+    /// meta 保留，一键恢复；running / waiting_permission 永不回收。
+    pub async fn idle_reaper(&self, app: &AppHandle) {
+        let victims: Vec<String> = {
+            let map = self.sessions.lock().await;
+            map.values()
+                .filter(|rt| {
+                    matches!(rt.meta.status.as_str(), "idle" | "error")
+                        && rt.last_activity.elapsed().as_secs() >= IDLE_HIBERNATE_SECS
+                })
+                .map(|rt| rt.meta.id.clone())
+                .collect()
+        };
+        for id in victims {
+            tracing::info!("闲置回收：休眠会话 {id}（>30 分钟无活动）");
+            let _ = self.hibernate(app.clone(), &id).await;
+        }
+    }
+
+    /// 「取消恢复」：杀掉 spawn 已成功但 initialize/load 还在途的进程。
+    /// fail_all_pending 会立刻打断在途请求，恢复流程随即报错返回。
+    pub async fn cancel_start(&self, session_id: &str) -> Result<()> {
+        let client = self.pending_spawns.lock().get(session_id).cloned();
+        match client {
+            Some(c) => {
+                tracing::info!("用户取消启动：杀掉会话 {session_id} 的在途 Agent");
+                c.kill().await
+            }
+            None => Err(anyhow!("该会话没有可取消的启动流程")),
+        }
+    }
+
+    /// 权限自动应答：命中「本会话内允许」缓存时直接批准，不再弹窗。
+    /// 命中时返回 true（已应答并广播状态）。
+    pub async fn try_auto_allow(
+        &self,
+        app: &AppHandle,
+        session_id: &str,
+        request_id: &Value,
+        params: &Value,
+    ) -> bool {
+        let scope = permission_scope_key(params);
+        let client = {
+            let mut map = self.sessions.lock().await;
+            let Some(rt) = map.get_mut(session_id) else {
+                return false;
+            };
+            if !rt.allow_scopes.contains(&scope) {
+                return false;
+            }
+            rt.meta.status = "running".into();
+            rt.last_stream_at = std::time::Instant::now();
+            rt.stall_notified = false;
+            let _ = app.emit("agent://state", &rt.meta);
+            match rt.client.as_ref() {
+                Some(c) => c.clone(),
+                None => return false,
+            }
+        };
+        let option_id = pick_allow_option(params);
+        let outcome = json!({
+            "outcome": { "outcome": "selected", "optionId": option_id }
+        });
+        if let Err(e) = client.respond(request_id.clone(), outcome).await {
+            tracing::warn!("自动批准应答失败（{scope}）：{e}");
+            return false;
+        }
+        let _ = app.emit(
+            "agent://permissionAuto",
+            json!({ "sessionId": session_id, "scope": scope }),
+        );
+        true
+    }
+
+    /// 「本会话内允许」：记住该 scope，本会话后续同类请求自动批准。
+    pub async fn remember_allow_scope(&self, session_id: &str, scope: String) {
+        let mut map = self.sessions.lock().await;
+        if let Some(rt) = map.get_mut(session_id) {
+            tracing::info!("会话 {session_id} 记住权限范围：{scope}");
+            rt.allow_scopes.insert(scope);
+        }
+    }
+
     /// 项目切换的进程回收：休眠**其他项目**里空闲/出错的活跃会话。
     /// 运行中 / 等待授权的会话不动（切换永不打断在忙的轮次）。
     /// 返回回收数量。会话 meta 保留，随时可一键恢复。
@@ -925,6 +1211,13 @@ fn spawn_event_forwarder(
             () => {
                 if !stream_buf.is_empty() {
                     let events = std::mem::take(&mut stream_buf);
+                    // 喂静默看门狗 / 闲置回收（按合批粒度，非逐 token）
+                    if let Some(state) = app.try_state::<crate::commands::AppState>() {
+                        state
+                            .supervisor
+                            .note_stream_activity(&desktop_session_id)
+                            .await;
+                    }
                     let _ = app.emit(
                         "agent://streamBatch",
                         json!({
@@ -1004,13 +1297,25 @@ async fn handle_immediate_event(
         AcpEvent::ServerRequest { id, method, params } => {
             let method_l = method.to_ascii_lowercase();
             if method_l.contains("permission") {
+                // 「本会话内允许」缓存命中 → 直接批准，不打断用户
+                if let Some(state) = app.try_state::<crate::commands::AppState>() {
+                    if state
+                        .supervisor
+                        .try_auto_allow(app, desktop_session_id, &id, &params)
+                        .await
+                    {
+                        return;
+                    }
+                }
                 let _ = app.emit(
                     "agent://permission",
                     json!({
                         "sessionId": desktop_session_id,
                         "id": id,
                         "method": method,
-                        "params": params
+                        "params": params,
+                        // 供前端「本会话内允许」回传（respond_permission.rememberScope）
+                        "scopeKey": permission_scope_key(&params)
                     }),
                 );
                 let _ = app.emit(
@@ -1116,6 +1421,88 @@ async fn dir_exists(path: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// 后台看门狗：15s 一拍做静默检查，每 4 拍（60s）做一次闲置回收。
+/// 从 lib.rs setup 启动一次。
+pub fn spawn_watchdog(app: AppHandle, supervisor: Arc<Supervisor>) {
+    tauri::async_runtime::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut n: u64 = 0;
+        loop {
+            tick.tick().await;
+            supervisor.stall_check(&app).await;
+            n += 1;
+            if n % 4 == 0 {
+                supervisor.idle_reaper(&app).await;
+            }
+        }
+    });
+}
+
+/// 权限请求的范围键（「本会话内允许」按此聚类）。
+/// 优先 tool kind（execute / edit / read …，粒度与 CLI 的权限档一致），
+/// 退化到工具标题的第一个词，再退化到 unknown。
+pub fn permission_scope_key(params: &Value) -> String {
+    let tool = params
+        .get("toolCall")
+        .or_else(|| params.get("tool_call"))
+        .or_else(|| params.get("tool"));
+    let kind = tool
+        .and_then(|t| t.get("kind").or_else(|| t.get("type")))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(k) = kind {
+        return format!("kind:{}", k.to_ascii_lowercase());
+    }
+    let title = tool
+        .and_then(|t| t.get("title").or_else(|| t.get("name")))
+        .or_else(|| params.get("title"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(t) = title {
+        let first = t.split_whitespace().next().unwrap_or(t);
+        return format!("tool:{}", first.to_ascii_lowercase());
+    }
+    "unknown".into()
+}
+
+/// 自动批准时选用的 optionId：优先请求自带 options 里 kind/id 含
+/// allow_once 的项，避免猜一个 CLI 不认识的 id；找不到则退回 "allow-once"。
+fn pick_allow_option(params: &Value) -> String {
+    if let Some(options) = params.get("options").and_then(|v| v.as_array()) {
+        // 先找 allow_once 类
+        for opt in options {
+            let kind = opt.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            let oid = opt
+                .get("optionId")
+                .or_else(|| opt.get("option_id"))
+                .or_else(|| opt.get("id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let k = kind.to_ascii_lowercase().replace('-', "_");
+            if !oid.is_empty() && (k == "allow_once" || oid.eq_ignore_ascii_case("allow-once")) {
+                return oid.to_string();
+            }
+        }
+        // 任意 allow 类（避开 always，本会话缓存不该升级为永久允许）
+        for opt in options {
+            let oid = opt
+                .get("optionId")
+                .or_else(|| opt.get("option_id"))
+                .or_else(|| opt.get("id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let l = oid.to_ascii_lowercase();
+            if !oid.is_empty() && l.contains("allow") && !l.contains("always") {
+                return oid.to_string();
+            }
+        }
+    }
+    "allow-once".into()
+}
+
 fn session_meta_json(prefs: &DesktopPrefs) -> Value {
     let mut meta = json!({});
     if prefs.permission_mode == "always-approve" {
@@ -1137,4 +1524,48 @@ fn extract_session_id(v: &Value) -> Option<String> {
         .and_then(|x| x.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scope_key_prefers_tool_kind() {
+        let p = json!({
+            "toolCall": { "kind": "Execute", "title": "Run tests" }
+        });
+        assert_eq!(permission_scope_key(&p), "kind:execute");
+    }
+
+    #[test]
+    fn scope_key_falls_back_to_title_first_word() {
+        let p = json!({ "toolCall": { "title": "Bash git status" } });
+        assert_eq!(permission_scope_key(&p), "tool:bash");
+        assert_eq!(permission_scope_key(&json!({})), "unknown");
+    }
+
+    #[test]
+    fn pick_allow_prefers_allow_once_kind() {
+        let p = json!({
+            "options": [
+                { "optionId": "reject", "kind": "reject_once" },
+                { "optionId": "proceed_once", "kind": "allow_once" },
+                { "optionId": "proceed_always", "kind": "allow_always" }
+            ]
+        });
+        assert_eq!(pick_allow_option(&p), "proceed_once");
+    }
+
+    #[test]
+    fn pick_allow_never_escalates_to_always() {
+        let p = json!({
+            "options": [
+                { "optionId": "allow-always" },
+                { "optionId": "allow-for-now" }
+            ]
+        });
+        assert_eq!(pick_allow_option(&p), "allow-for-now");
+        assert_eq!(pick_allow_option(&json!({})), "allow-once");
+    }
 }

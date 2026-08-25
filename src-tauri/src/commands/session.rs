@@ -93,10 +93,34 @@ pub async fn respond_permission(
     request_id: Value,
     allow: bool,
     option_id: Option<String>,
+    remember_scope: Option<String>,
 ) -> Result<(), String> {
     state
         .supervisor
-        .respond_permission(app, &session_id, request_id, allow, option_id)
+        .respond_permission(app, &session_id, request_id, allow, option_id, remember_scope)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 静默提示的「继续等待」：重置该会话的静默计时。
+#[tauri::command]
+pub async fn stall_keep_waiting(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<(), String> {
+    state.supervisor.stall_keep_waiting(&session_id).await;
+    Ok(())
+}
+
+/// 取消一次在途的会话启动/恢复（杀掉 initialize/load 中的 Agent 进程）。
+#[tauri::command]
+pub async fn cancel_start(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<(), String> {
+    state
+        .supervisor
+        .cancel_start(&session_id)
         .await
         .map_err(|e| e.to_string())
 }

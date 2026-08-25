@@ -97,6 +97,14 @@ export default function App() {
       ? s.transcripts[activeSessionId] ?? EMPTY_BLOCKS
       : EMPTY_BLOCKS
   );
+  // 忙时排队 / 静默看门狗（当前会话）
+  const queuedCount = useSessionStore((s) =>
+    activeSessionId ? s.sendQueue[activeSessionId]?.length ?? 0 : 0
+  );
+  const activeStall = useSessionStore((s) =>
+    activeSessionId ? s.stall[activeSessionId] ?? null : null
+  );
+  const clearStall = useSessionStore((s) => s.clearStall);
   const historyTail = useUiStore((s) => s.historyTail);
   const showSettings = useUiStore((s) => s.showSettings);
   const setShowSettings = useUiStore((s) => s.setShowSettings);
@@ -348,7 +356,7 @@ export default function App() {
   });
 
   // —— 恢复会话（依赖 loadTranscriptForSession，必须在 useSessionActions 之后）
-  const { resumeMeta, resumeDiskSession } = useResumeSession({
+  const { resumeMeta, resumeDiskSession, resuming } = useResumeSession({
     busy,
     setBusy,
     projects,
@@ -841,16 +849,52 @@ export default function App() {
           </div>
         </div>
 
+        {activeStall && activeLive && (
+          <div className="stall-banner" role="status">
+            <span>
+              小精灵已静默约 {Math.max(1, Math.round(activeStall.silentSecs / 60))}{" "}
+              分钟。可能仍在思考/等待长任务；不会自动取消。
+            </span>
+            <span className="spacer" />
+            <button
+              type="button"
+              className="btn sm"
+              onClick={() => {
+                clearStall(activeLive.id);
+                void api
+                  .stallKeepWaiting(activeLive.id)
+                  .catch((e) => flash(String(e), "error"));
+              }}
+            >
+              继续等待
+            </button>
+            <button
+              type="button"
+              className="btn sm danger"
+              onClick={() => {
+                clearStall(activeLive.id);
+                void api
+                  .cancelPrompt(activeLive.id)
+                  .then(() => flash("已请求结束本轮", "info"))
+                  .catch((e) => flash(String(e), "error"));
+              }}
+            >
+              结束本轮
+            </button>
+          </div>
+        )}
+
         <Composer
           activeSessionId={activeSessionId}
           agentName={agentName(activeLive?.agentId)}
           input={input}
           setInput={setInput}
-          busy={
-            busy ||
+          busy={busy}
+          turnRunning={
             activeLive?.status === "running" ||
             activeLive?.status === "waiting_permission"
           }
+          queuedCount={queuedCount}
           statusHint={statusLabel(activeLive?.status)}
           showStop={
             !!(
@@ -868,6 +912,25 @@ export default function App() {
           onSend={() => void sendPrompt()}
         />
       </main>
+
+      {resuming && (
+        <div className="resume-banner" role="status">
+          <span className="chat-paint-spinner" />
+          <span>正在恢复会话「{resuming.title}」…</span>
+          <button
+            type="button"
+            className="btn sm"
+            onClick={() => {
+              void api
+                .cancelStart(resuming.id)
+                .then(() => flash("已取消恢复", "info"))
+                .catch((e) => flash(String(e), "error"));
+            }}
+          >
+            取消
+          </button>
+        </div>
+      )}
 
       {showReview && (
         <div className="review-col">
@@ -967,8 +1030,8 @@ export default function App() {
       {permission && (
         <PermissionModal
           request={permission}
-          onRespond={(allow, optionId) => {
-            void respondPermission(allow, optionId);
+          onRespond={(allow, optionId, rememberSession) => {
+            void respondPermission(allow, optionId, rememberSession);
           }}
         />
       )}

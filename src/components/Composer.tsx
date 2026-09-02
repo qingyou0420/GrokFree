@@ -1,4 +1,7 @@
-/** Bottom prompt composer: input, send/queue, stop */
+/** Bottom prompt composer: input, polish, send/queue, stop */
+
+import { useEffect, useRef } from "react";
+import { IconStar } from "./Icons";
 
 type Props = {
   activeSessionId: string | null;
@@ -14,8 +17,10 @@ type Props = {
   queuedCount?: number;
   statusHint: string;
   showStop: boolean;
+  polishing?: boolean;
   onStop: () => void;
   onSend: () => void;
+  onPolish: () => void;
 };
 
 export function Composer({
@@ -28,13 +33,25 @@ export function Composer({
   queuedCount = 0,
   statusHint,
   showStop,
+  polishing = false,
   onStop,
   onSend,
+  onPolish,
 }: Props) {
+  const taRef = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+    const ta = taRef.current;
+    if (!ta) return;
+    ta.style.height = "auto";
+    ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
+  }, [input]);
+
   return (
     <div className="composer-wrap">
       <div className="composer">
         <textarea
+          ref={taRef}
           placeholder={
             activeSessionId
               ? turnRunning
@@ -43,14 +60,9 @@ export function Composer({
               : "请先新建或恢复一个会话"
           }
           value={input}
-          disabled={!activeSessionId || busy}
+          disabled={!activeSessionId || busy || polishing}
           rows={2}
-          onChange={(e) => {
-            setInput(e.target.value);
-            const ta = e.target;
-            ta.style.height = "auto";
-            ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
-          }}
+          onChange={(e) => setInput(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey) {
               e.preventDefault();
@@ -77,8 +89,18 @@ export function Composer({
           )}
           <button
             type="button"
+            className={`icon-btn composer-polish${polishing ? " polishing" : ""}`}
+            title="把草稿强化成更可执行的提示词"
+            aria-label={polishing ? "正在强化提示词" : "强化提示词"}
+            disabled={!activeSessionId || !input.trim() || busy || polishing}
+            onClick={() => void onPolish()}
+          >
+            <IconStar size={15} />
+          </button>
+          <button
+            type="button"
             className="btn sm primary"
-            disabled={!activeSessionId || !input.trim() || busy}
+            disabled={!activeSessionId || !input.trim() || busy || polishing}
             onClick={() => void onSend()}
           >
             {turnRunning ? "排队" : "发送"}

@@ -131,6 +131,18 @@ export function IconTool(p: IconProps) {
   );
 }
 
+export function IconStar(p: IconProps) {
+  return (
+    <Svg {...p}>
+      <path
+        d="M8 1.4 9.6 6.2 14.6 8 9.6 9.8 8 14.6 6.4 9.8 1.4 8 6.4 6.2Z"
+        fill="currentColor"
+        stroke="none"
+      />
+    </Svg>
+  );
+}
+
 export function IconAgent(p: IconProps) {
   return (
     <Svg {...p}>

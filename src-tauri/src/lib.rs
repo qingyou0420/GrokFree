@@ -10,6 +10,7 @@ mod git_ops;
 mod job_object;
 mod journal;
 mod paths;
+mod polish;
 mod process_util;
 mod session_fsm;
 mod sessions_disk;
@@ -174,6 +175,7 @@ pub fn run() {
             commands::session::list_live_sessions,
             commands::session::send_prompt,
             commands::session::cancel_prompt,
+            commands::polish_prompt,
             commands::session::respond_permission,
             commands::session::handle_server_request,
             commands::session::hibernate_session,

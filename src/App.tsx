@@ -58,7 +58,7 @@ import {
   type ConfirmState,
 } from "./state";
 
-const APP_VERSION = "0.9.1";
+const APP_VERSION = "0.9.2";
 
 const defaultPrefs: DesktopPrefs = {
   grokPath: "",
@@ -268,7 +268,8 @@ export default function App() {
   });
 
   // —— 输入 / 润色 / 发送（不再持全局 busy，按会话状态门禁）
-  const { input, setInput, sendPrompt } = useComposerActions({
+  const { input, setInput, sendPrompt, polishPrompt, polishing } =
+    useComposerActions({
     stickToBottom,
     scrollToBottom,
     flash,
@@ -913,6 +914,8 @@ export default function App() {
               .catch((e) => flash(String(e), "error"));
           }}
           onSend={() => void sendPrompt()}
+          polishing={polishing}
+          onPolish={() => void polishPrompt()}
         />
       </main>
 

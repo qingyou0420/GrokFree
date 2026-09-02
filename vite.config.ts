@@ -17,6 +17,9 @@ export default defineConfig({
     watch: { ignored: ["**/src-tauri/**"] },
   },
   envPrefix: ["VITE_", "TAURI_"],
+  optimizeDeps: {
+    include: ["mermaid"],
+  },
   test: {
     environment: "node",
     include: ["src/**/*.test.ts"],

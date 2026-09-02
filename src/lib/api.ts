@@ -91,6 +91,8 @@ export const api = {
     }),
   sendPrompt: (sessionId: string, text: string) =>
     invoke<void>("send_prompt", { sessionId, text }),
+  /** 输入框草稿润色（xAI Chat Completions，不发送给 agent） */
+  polishPrompt: (text: string) => invoke<string>("polish_prompt", { text }),
   cancelPrompt: (sessionId: string) =>
     invoke<void>("cancel_prompt", { sessionId }),
   respondPermission: (

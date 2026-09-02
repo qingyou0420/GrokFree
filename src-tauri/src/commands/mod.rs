@@ -67,6 +67,13 @@ pub async fn update_prefs(state: State<'_, AppState>, prefs: DesktopPrefs) -> Re
     Ok(state.desktop.lock().clone())
 }
 
+/// 输入框提示词润色：把草稿改成更可执行的 agent 提示词，不发送、不走 ACP。
+#[tauri::command]
+pub async fn polish_prompt(state: State<'_, AppState>, text: String) -> Result<String, String> {
+    let model = state.desktop.lock().prefs.model.clone();
+    crate::polish::polish_prompt(&text, &model).await
+}
+
 #[tauri::command]
 pub async fn set_onboarding_done(state: State<'_, AppState>, done: bool) -> Result<DesktopState, String> {
     let mut st = state.desktop.lock();

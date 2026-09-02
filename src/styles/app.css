@@ -731,6 +731,23 @@ input:focus:not(:focus-visible) {
   flex: 1;
 }
 
+.composer-polish {
+  flex-shrink: 0;
+}
+.composer-polish.polishing {
+  color: var(--accent);
+  animation: composer-polish-pulse 0.9s ease-in-out infinite;
+}
+.icon-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+@keyframes composer-polish-pulse {
+  50% {
+    opacity: 0.45;
+  }
+}
+
 
 
 .mode-pill {
@@ -2640,4 +2657,63 @@ details.tool-card > summary.tool-card-summary::-webkit-details-marker {
   border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
   background: var(--accent-soft);
   color: var(--accent);
+}
+
+/* —— 对话内 Mermaid 图示（脑图 / 流程图 / 时序图…） */
+.mermaid-card {
+  margin: 10px 0;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  overflow: hidden;
+}
+.mermaid-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--bg-panel);
+  font-size: 12px;
+}
+.mermaid-label {
+  font-weight: 600;
+  color: var(--text);
+}
+.mermaid-status {
+  color: var(--text-muted);
+}
+.mermaid-diagram {
+  overflow: auto;
+  max-height: min(480px, 70vh);
+  padding: 12px 14px;
+  background: var(--bg-elevated);
+}
+.mermaid-diagram svg {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 0 auto;
+}
+.block.assistant .md .mermaid-card .mermaid-source {
+  margin: 0;
+  max-height: min(320px, 50vh);
+  border: none;
+  border-radius: 0;
+  background: var(--bg-panel);
+}
+.mermaid-lightbox-modal {
+  width: min(1100px, 96vw);
+  max-height: 94vh;
+  display: flex;
+  flex-direction: column;
+}
+.mermaid-lightbox .mermaid-lightbox-body {
+  max-height: calc(94vh - 52px);
+}
+.mermaid-diagram-lg {
+  max-height: none;
+}
+.mermaid-diagram-lg svg {
+  max-width: none;
 }

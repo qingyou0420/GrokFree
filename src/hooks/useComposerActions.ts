@@ -27,6 +27,7 @@ export function useComposerActions(opts: {
 }) {
   const { stickToBottom, scrollToBottom, flash } = opts;
   const [input, setInput] = useState("");
+  const [polishing, setPolishing] = useState(false);
   const setTranscripts = useSessionStore((s) => s.setTranscripts);
 
   const sendPrompt = useCallback(async () => {
@@ -77,9 +78,30 @@ export function useComposerActions(opts: {
     }
   }, [input, stickToBottom, setTranscripts, scrollToBottom, flash]);
 
+  const polishPrompt = useCallback(async () => {
+    const text = input.trim();
+    if (!text || polishing) return;
+    setPolishing(true);
+    try {
+      const out = await api.polishPrompt(text);
+      if (out.trim()) {
+        setInput(out.trim());
+        flash("已强化，确认后发送", "success");
+      } else {
+        flash("模型返回为空", "error");
+      }
+    } catch (e) {
+      flash(`强化失败：${e}`, "error");
+    } finally {
+      setPolishing(false);
+    }
+  }, [input, polishing, flash]);
+
   return {
     input,
     setInput,
     sendPrompt,
+    polishPrompt,
+    polishing,
   };
 }

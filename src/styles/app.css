@@ -2717,3 +2717,47 @@ details.tool-card > summary.tool-card-summary::-webkit-details-marker {
 .mermaid-diagram-lg svg {
   max-width: none;
 }
+
+.mindmap-fallback {
+  display: flex;
+  align-items: flex-start;
+  gap: 18px;
+  padding: 4px 0;
+  overflow: auto;
+  min-height: 80px;
+}
+.mm-root {
+  flex-shrink: 0;
+  padding: 8px 14px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent);
+  color: var(--accent);
+  font-weight: 600;
+  white-space: nowrap;
+  margin-top: 6px;
+}
+.mm-kids {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border-left: 1px solid var(--border);
+  padding-left: 14px;
+}
+.mm-kids-root {
+  border-left-color: color-mix(in srgb, var(--accent) 35%, transparent);
+}
+.mm-branch {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+.mm-node {
+  flex-shrink: 0;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-panel);
+  border: 1px solid var(--border-subtle);
+  color: var(--text);
+  white-space: nowrap;
+}

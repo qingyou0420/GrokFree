@@ -18,7 +18,7 @@ export default defineConfig({
   },
   envPrefix: ["VITE_", "TAURI_"],
   optimizeDeps: {
-    include: ["mermaid"],
+    include: ["mermaid/dist/mermaid.min.js"],
   },
   test: {
     environment: "node",

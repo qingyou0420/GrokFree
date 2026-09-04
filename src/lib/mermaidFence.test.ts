@@ -3,6 +3,7 @@ import {
   isMermaidLang,
   mermaidKind,
   mermaidKindLabel,
+  parseMindmapOutline,
   splitMarkdownMermaid,
 } from "./mermaidFence";
 
@@ -60,5 +61,30 @@ describe("splitMarkdownMermaid", () => {
     expect(splitMarkdownMermaid(text)).toEqual([
       { type: "mermaid", body: "flowchart TD\n  A --> B" },
     ]);
+  });
+
+  it("accepts a space after the fence marker", () => {
+    const text = "``` mermaid\nmindmap\n  root((x))\n```";
+    expect(splitMarkdownMermaid(text)[0]).toEqual({
+      type: "mermaid",
+      body: "mindmap\n  root((x))",
+    });
+  });
+});
+
+describe("parseMindmapOutline", () => {
+  it("builds a tree from indented mindmap syntax", () => {
+    const tree = parseMindmapOutline(`mindmap
+  root((构想))
+    用户
+      谁
+    流程`);
+    expect(tree?.label).toBe("构想");
+    expect(tree?.children.map((c) => c.label)).toEqual(["用户", "流程"]);
+    expect(tree?.children[0].children[0].label).toBe("谁");
+  });
+
+  it("returns null for non-mindmap charts", () => {
+    expect(parseMindmapOutline("flowchart TD\n  A --> B")).toBeNull();
   });
 });

@@ -62,7 +62,7 @@ export type MarkdownPart =
  */
 export function splitMarkdownMermaid(text: string): MarkdownPart[] {
   const parts: MarkdownPart[] = [];
-  const openRe = /```mermaid[ \t]*\r?\n/g;
+  const openRe = /```[ \t]*mermaid[ \t]*\r?\n/gi;
   let last = 0;
   let m: RegExpExecArray | null;
   while ((m = openRe.exec(text))) {
@@ -84,4 +84,70 @@ export function splitMarkdownMermaid(text: string): MarkdownPart[] {
   }
   if (last < text.length) parts.push({ type: "md", body: text.slice(last) });
   return parts.length ? parts : [{ type: "md", body: text }];
+}
+
+export type MindmapNode = {
+  label: string;
+  children: MindmapNode[];
+};
+
+function shapeLabel(raw: string): string {
+  let s = raw.trim();
+  const wrap = [
+    /^\(\((.*)\)\)$/s,
+    /^\[\[(.*)\]\]$/s,
+    /^\[\((.*)\)\]$/s,
+    /^\(\[(.*)\]\)$/s,
+    /^\{\{(.*)\}\}$/s,
+    /^\)\)(.*)\(\($/s,
+    /^](.*)\[$/s,
+    /^\((.*)\)$/s,
+    /^\[(.*)\]$/s,
+    /^[A-Za-z][\w-]*\(\((.*)\)\)$/s,
+  ];
+  for (const re of wrap) {
+    const m = s.match(re);
+    if (m?.[1] !== undefined) {
+      s = m[1].trim();
+      break;
+    }
+  }
+  return s.trim() || raw.trim();
+}
+
+/** mermaid 脑图缩进大纲 → 树。解析失败返回 null，走 mermaid 引擎。 */
+export function parseMindmapOutline(chart: string): MindmapNode | null {
+  const lines = chart.split(/\r?\n/).map((l) => l.replace(/\t/g, "  "));
+  const rows: { indent: number; label: string }[] = [];
+  let started = false;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("%%")) continue;
+    if (trimmed === "---") continue;
+    if (!started) {
+      if (/^mindmap\b/i.test(trimmed)) {
+        started = true;
+        continue;
+      }
+      return null;
+    }
+    const indent = (line.match(/^ */)?.[0].length ?? 0);
+    rows.push({ indent, label: shapeLabel(trimmed) });
+  }
+  if (!started || rows.length === 0) return null;
+
+  const root: MindmapNode = { label: rows[0].label, children: [] };
+  const stack: { indent: number; node: MindmapNode }[] = [
+    { indent: rows[0].indent, node: root },
+  ];
+  for (let i = 1; i < rows.length; i++) {
+    const row = rows[i];
+    const node: MindmapNode = { label: row.label, children: [] };
+    while (stack.length > 1 && row.indent <= stack[stack.length - 1].indent) {
+      stack.pop();
+    }
+    stack[stack.length - 1].node.children.push(node);
+    stack.push({ indent: row.indent, node });
+  }
+  return root;
 }

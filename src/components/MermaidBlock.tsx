@@ -1,7 +1,12 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { mermaidKind, mermaidKindLabel } from "../lib/mermaidFence";
+import {
+  mermaidKind,
+  mermaidKindLabel,
+  parseMindmapOutline,
+} from "../lib/mermaidFence";
 import { renderMermaidChart } from "../lib/mermaidRender";
+import { MindmapFallback } from "./MindmapFallback";
 
 type View = "diagram" | "source";
 
@@ -9,8 +14,9 @@ export function MermaidBlock({ chart }: { chart: string }) {
   const reactId = useId();
   const bodyRef = useRef<HTMLDivElement>(null);
   const [svg, setSvg] = useState<string | null>(null);
-  const [error, setError] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(true);
+  const fallbackTree = parseMindmapOutline(chart);
   const [view, setView] = useState<View>("diagram");
   const [expanded, setExpanded] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -32,25 +38,25 @@ export function MermaidBlock({ chart }: { chart: string }) {
 
   useEffect(() => {
     setSvg(null);
-    setError(false);
+    setError(null);
     setBusy(true);
   }, [chart]);
 
   useEffect(() => {
     let cancelled = false;
     setBusy(true);
-    setError(false);
+    setError(null);
     const t = window.setTimeout(() => {
       void (async () => {
         const result = await renderMermaidChart(chart);
         if (cancelled) return;
         if ("error" in result) {
-          setError(true);
+          setError(result.error);
           setBusy(false);
           return;
         }
         setSvg(result.svg);
-        setError(false);
+        setError(null);
         setBusy(false);
         requestAnimationFrame(() => {
           if (!cancelled && result.bindFunctions && bodyRef.current) {
@@ -87,12 +93,18 @@ export function MermaidBlock({ chart }: { chart: string }) {
     }
   };
 
-  const showSvg = view === "diagram" && svg && !error;
-  const status = error
-    ? "还不能画（语法未完成或无效）"
-    : busy && !svg
-      ? "绘制中…"
-      : null;
+  const showSvg = view === "diagram" && !!svg;
+  const showFallback =
+    view === "diagram" && !svg && !busy && !!fallbackTree;
+  const status = showSvg
+    ? null
+    : showFallback
+      ? null
+      : busy
+        ? "绘制中…"
+        : error
+          ? "还不能画"
+          : null;
 
   const diagram = showSvg ? (
     <div
@@ -100,6 +112,10 @@ export function MermaidBlock({ chart }: { chart: string }) {
       className="mermaid-diagram"
       dangerouslySetInnerHTML={{ __html: svg }}
     />
+  ) : showFallback && fallbackTree ? (
+    <div className="mermaid-diagram">
+      <MindmapFallback tree={fallbackTree} />
+    </div>
   ) : (
     <pre className="mermaid-source">{chart || " "}</pre>
   );
@@ -124,14 +140,14 @@ export function MermaidBlock({ chart }: { chart: string }) {
           type="button"
           className="btn sm ghost"
           onClick={() => setExpanded(true)}
-          disabled={!svg}
+          disabled={!svg && !fallbackTree}
         >
           放大
         </button>
       </div>
       {diagram}
       {expanded &&
-        svg &&
+        (svg || fallbackTree) &&
         createPortal(
           <div
             className="modal-backdrop mermaid-lightbox"
@@ -157,10 +173,16 @@ export function MermaidBlock({ chart }: { chart: string }) {
                 </button>
               </header>
               <div className="body mermaid-lightbox-body">
-                <div
-                  className="mermaid-diagram mermaid-diagram-lg"
-                  dangerouslySetInnerHTML={{ __html: svg }}
-                />
+                {svg ? (
+                  <div
+                    className="mermaid-diagram mermaid-diagram-lg"
+                    dangerouslySetInnerHTML={{ __html: svg }}
+                  />
+                ) : fallbackTree ? (
+                  <div className="mermaid-diagram mermaid-diagram-lg">
+                    <MindmapFallback tree={fallbackTree} />
+                  </div>
+                ) : null}
               </div>
             </div>
           </div>,

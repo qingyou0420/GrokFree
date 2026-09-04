@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "GrokFree",
-  "version": "0.9.2",
+  "version": "0.9.3",
   "identifier": "app.grokfree.desktop",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -32,7 +32,7 @@
           "$RESOURCE/**"
         ]
       },
-      "csp": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: asset: http://asset.localhost https://asset.localhost https: http:; connect-src 'self' ipc: http://ipc.localhost https://api.x.ai https://*.x.ai https://api.github.com https://github.com https://*.githubusercontent.com"
+      "csp": "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval' blob:; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: asset: http://asset.localhost https://asset.localhost https: http:; connect-src 'self' ipc: http://ipc.localhost https://api.x.ai https://*.x.ai https://api.github.com https://github.com https://*.githubusercontent.com"
     }
   },
   "bundle": {

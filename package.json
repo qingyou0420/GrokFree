@@ -1,6 +1,6 @@
 {
   "name": "grokfree",
-  "version": "0.9.2",
+  "version": "0.9.3",
   "private": true,
   "description": "GrokFree — Tauri 2 desktop client for Grok CLI over ACP",
   "type": "module",

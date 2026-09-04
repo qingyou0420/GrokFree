@@ -451,7 +451,7 @@ export const SettingsModal = memo(function SettingsModal({
                 </div>
                 <div>
                   <label>Desktop 版本</label>
-                  <div>{appInfo?.version || "0.9.3"}</div>
+                  <div>{appInfo?.version || "0.9.4"}</div>
                 </div>
                 <div>
                   <label>CLI 版本</label>
@@ -666,7 +666,7 @@ export const SettingsModal = memo(function SettingsModal({
                   {updateBusy ? "检查中…" : "检查更新"}
                 </button>
               </div>
-              <div className="help">v0.9.3 · 一键云端更新</div>
+              <div className="help">v0.9.4 · 一键云端更新</div>
             </>
           )}
         </div>

@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   mermaidKind,
@@ -16,7 +16,7 @@ export function MermaidBlock({ chart }: { chart: string }) {
   const [svg, setSvg] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(true);
-  const fallbackTree = parseMindmapOutline(chart);
+  const fallbackTree = useMemo(() => parseMindmapOutline(chart), [chart]);
   const [view, setView] = useState<View>("diagram");
   const [expanded, setExpanded] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -39,10 +39,12 @@ export function MermaidBlock({ chart }: { chart: string }) {
   useEffect(() => {
     setSvg(null);
     setError(null);
-    setBusy(true);
-  }, [chart]);
+    // 脑图不走 mermaid：引擎在 Tauri WebView 里会挂死，卡片永远「绘制中」
+    setBusy(!fallbackTree);
+  }, [chart, fallbackTree]);
 
   useEffect(() => {
+    if (fallbackTree) return;
     let cancelled = false;
     setBusy(true);
     setError(null);
@@ -69,7 +71,7 @@ export function MermaidBlock({ chart }: { chart: string }) {
       cancelled = true;
       window.clearTimeout(t);
     };
-  }, [chart, theme]);
+  }, [chart, theme, fallbackTree]);
 
   useEffect(() => {
     if (!expanded) return;
@@ -94,8 +96,7 @@ export function MermaidBlock({ chart }: { chart: string }) {
   };
 
   const showSvg = view === "diagram" && !!svg;
-  const showFallback =
-    view === "diagram" && !svg && !busy && !!fallbackTree;
+  const showFallback = view === "diagram" && !svg && !!fallbackTree;
   const status = showSvg
     ? null
     : showFallback

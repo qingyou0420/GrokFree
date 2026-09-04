@@ -58,13 +58,20 @@ export async function renderMermaidChart(
   const trimmed = chart.trim();
   if (!trimmed) return { error: "empty", kind };
 
-  const mermaid = await getMermaid();
   const id = `gf-mmd-${++seq}`;
-  try {
-    // 不要先 parse 再 render：mindmap 在部分 WebView 里 parse 会误报失败。
+  const work = async () => {
+    const mermaid = await getMermaid();
     const result = await mermaid.render(id, trimmed);
-    if (!result?.svg) return { error: "empty-svg", kind };
+    if (!result?.svg) throw new Error("empty-svg");
     return { ...result, kind };
+  };
+  try {
+    return await Promise.race([
+      work(),
+      new Promise<MermaidFail>((_, reject) => {
+        window.setTimeout(() => reject(new Error("timeout")), 4000);
+      }),
+    ]);
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e);
     return { error: message || "parse", kind };

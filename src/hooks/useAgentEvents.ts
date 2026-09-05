@@ -148,6 +148,37 @@ export function useAgentEvents(opts: {
         )
       );
       unsubs.push(
+        await api.on<{
+          sessionId: string;
+          ok?: boolean;
+          text?: string;
+          error?: string;
+          attempt?: number;
+        }>("agent://autoContinue", (p) => {
+          if (p.ok && p.text) {
+            setTranscripts((prev) => ({
+              ...prev,
+              [p.sessionId]: [
+                ...(prev[p.sessionId] ?? []),
+                { kind: "system", id: uid("sys"), text: "进程中断，已自动恢复会话" },
+                { kind: "user", id: uid("u"), text: p.text as string },
+              ],
+            }));
+            flash(
+              `已自动恢复并继续${p.attempt ? `（第 ${p.attempt} 次）` : ""}`,
+              "info",
+              p.sessionId
+            );
+          } else {
+            flash(
+              `自动恢复失败${p.error ? `：${p.error}` : ""}，请手动恢复后发送「继续」`,
+              "error",
+              p.sessionId
+            );
+          }
+        })
+      );
+      unsubs.push(
         // 静默看门狗：只提示「继续等待 / 结束本轮」，绝不自动取消
         await api.on<{ sessionId: string; title: string; silentSecs: number }>(
           "agent://stall",

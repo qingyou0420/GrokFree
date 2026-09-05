@@ -83,6 +83,10 @@ const IDLE_HIBERNATE_SECS: u64 = 30 * 60;
 const STALL_SILENCE_SECS: u64 = 300;
 /// 本轮从未产生 token/工具事件时的静默阈值（挂死的 prompt 应更早提示）。
 const STALL_SILENCE_NO_OUTPUT_SECS: u64 = 120;
+/// 进程意外退出后自动恢复并补发「继续」的次数上限（防崩溃死循环）。
+const MAX_AUTO_CONTINUES: u8 = 2;
+const AUTO_CONTINUE_PROMPT: &str =
+    "继续。上一轮因超时或进程退出中断。请从中断处接着完成，不要重复已经做过的修改。";
 
 pub struct Supervisor {
     sessions: Mutex<HashMap<String, SessionRuntime>>,
@@ -100,6 +104,8 @@ pub struct Supervisor {
     /// Spawn 已成功但 initialize/session-load 还在途的 client（按桌面会话 id）。
     /// 「取消恢复」由此杀掉在途进程；成功/失败后由 RAII 守卫移除。
     pending_spawns: Arc<StdMutex<HashMap<String, Arc<AcpClient>>>>,
+    /// 每个桌面会话已自动续跑的次数（跨 hibernate/resume 存活）。
+    auto_continues: StdMutex<HashMap<String, u8>>,
 }
 
 /// RAII: removes the start-guard key when the create/resume attempt ends.
@@ -152,6 +158,7 @@ impl Supervisor {
             spawn_gate: Mutex::new(()),
             starting: StdMutex::new(std::collections::HashSet::new()),
             pending_spawns: Arc::new(StdMutex::new(HashMap::new())),
+            auto_continues: StdMutex::new(HashMap::new()),
         }
     }
 
@@ -625,6 +632,7 @@ impl Supervisor {
             match &result {
                 Ok(_) => {
                     rt.meta.status = fsm::transition(&rt.meta.status, FsmEvent::PromptOk).into();
+                    self.auto_continues.lock().remove(session_id);
                 }
                 Err(e) => {
                     rt.meta.status =
@@ -1188,20 +1196,106 @@ impl Supervisor {
         code: Option<i32>,
         client_instance: u64,
     ) {
-        let mut map = self.sessions.lock().await;
-        if let Some(rt) = map.get_mut(session_id) {
-            if rt.client_gen != client_instance {
-                tracing::info!(
-                    "忽略陈旧的 Agent 退出事件（会话 {session_id} 已由新 Agent 接管）"
+        let mut snapshot: Option<LiveSession> = None;
+        {
+            let mut map = self.sessions.lock().await;
+            if let Some(rt) = map.get_mut(session_id) {
+                if rt.client_gen != client_instance {
+                    tracing::info!(
+                        "忽略陈旧的 Agent 退出事件（会话 {session_id} 已由新 Agent 接管）"
+                    );
+                    return;
+                }
+                let killed = rt.client.as_ref().map(|c| c.is_killed()).unwrap_or(false);
+                let inflight = rt.prompt_inflight;
+                rt.client = None;
+                rt.meta.status = fsm::transition(&rt.meta.status, FsmEvent::AgentExited).into();
+                rt.meta.error = Some(format!("Agent 进程已退出：{code:?}"));
+                rt.prompt_inflight = false;
+                let _ = app.emit("agent://state", &rt.meta);
+                if inflight && !killed && rt.meta.grok_session_id.is_some() {
+                    snapshot = Some(rt.meta.clone());
+                }
+            }
+        }
+        if let Some(meta) = snapshot {
+            self.schedule_auto_continue(app.clone(), meta);
+        }
+    }
+
+    fn schedule_auto_continue(&self, app: AppHandle, meta: LiveSession) {
+        let n = {
+            let mut map = self.auto_continues.lock();
+            let e = map.entry(meta.id.clone()).or_insert(0);
+            if *e >= MAX_AUTO_CONTINUES {
+                tracing::warn!(
+                    "会话 {} 自动续跑已达 {MAX_AUTO_CONTINUES} 次，不再重试",
+                    meta.id
                 );
                 return;
             }
-            rt.client = None;
-            rt.meta.status = fsm::transition(&rt.meta.status, FsmEvent::AgentExited).into();
-            rt.meta.error = Some(format!("Agent 进程已退出：{code:?}"));
-            rt.prompt_inflight = false;
-            let _ = app.emit("agent://state", &rt.meta);
-        }
+            *e += 1;
+            *e
+        };
+        tracing::info!("会话 {} 进程意外退出，将自动恢复并继续（第 {n} 次）", meta.id);
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+            let Some(state) = app.try_state::<crate::commands::AppState>() else {
+                return;
+            };
+            let Some(gsid) = meta.grok_session_id.clone() else {
+                return;
+            };
+            if let Err(e) = state
+                .supervisor
+                .resume_session(
+                    app.clone(),
+                    meta.id.clone(),
+                    gsid,
+                    meta.project_id.clone(),
+                    meta.cwd.clone(),
+                    meta.title.clone(),
+                    Some(meta.agent_id.clone()),
+                )
+                .await
+            {
+                tracing::warn!("自动恢复会话 {} 失败：{e}", meta.id);
+                let _ = app.emit(
+                    "agent://autoContinue",
+                    json!({
+                        "sessionId": meta.id,
+                        "ok": false,
+                        "error": e.to_string(),
+                    }),
+                );
+                return;
+            }
+            if let Err(e) = state
+                .supervisor
+                .send_prompt(app.clone(), &meta.id, AUTO_CONTINUE_PROMPT)
+                .await
+            {
+                tracing::warn!("自动继续发送失败（{}）：{e}", meta.id);
+                let _ = app.emit(
+                    "agent://autoContinue",
+                    json!({
+                        "sessionId": meta.id,
+                        "ok": false,
+                        "error": e.to_string(),
+                    }),
+                );
+                return;
+            }
+            let _ = app.emit(
+                "agent://autoContinue",
+                json!({
+                    "sessionId": meta.id,
+                    "ok": true,
+                    "text": AUTO_CONTINUE_PROMPT,
+                    "attempt": n,
+                }),
+            );
+        });
     }
 
     pub async fn set_status(&self, app: &AppHandle, session_id: &str, status: &str) {

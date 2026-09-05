@@ -212,6 +212,10 @@ impl AcpClient {
         self.instance
     }
 
+    pub fn is_killed(&self) -> bool {
+        self.killed.load(Ordering::SeqCst)
+    }
+
     /// Fail every in-flight request with `reason`; used on process exit/kill.
     async fn fail_all_pending(&self, reason: &str) {
         let mut map = self.pending.lock().await;

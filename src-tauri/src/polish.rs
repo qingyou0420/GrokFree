@@ -60,6 +60,56 @@ pub fn sanitize_polished(raw: &str) -> String {
     s
 }
 
+/// grok CLI ≥1.0 的 auth.json 是 `{ "https://auth.x.ai::<id>": { "key": "<jwt>", ... } }`，
+/// 不再把 token 放在顶层 `api_key` / `access_token`。
+pub fn extract_api_key_from_auth(v: &Value) -> Option<String> {
+    let mut best: Option<(i32, String)> = None;
+    fn consider(best: &mut Option<(i32, String)>, field: &str, raw: &str) {
+        let t = raw.trim();
+        if t.is_empty() || t.len() < 8 {
+            return;
+        }
+        let mut score = t.len() as i32;
+        if field == "api_key" || t.starts_with("xai-") {
+            score += 10_000;
+        } else if field == "access_token" || field == "token" {
+            score += 1_000;
+        } else if field == "key" {
+            score += 500;
+        }
+        match best {
+            Some((s, _)) if *s >= score => {}
+            _ => *best = Some((score, t.to_string())),
+        }
+    }
+    fn walk(v: &Value, best: &mut Option<(i32, String)>) {
+        match v {
+            Value::Object(map) => {
+                for (k, val) in map {
+                    let lk = k.to_ascii_lowercase();
+                    if matches!(
+                        lk.as_str(),
+                        "api_key" | "access_token" | "token" | "key"
+                    ) {
+                        if let Some(s) = val.as_str() {
+                            consider(best, lk.as_str(), s);
+                        }
+                    }
+                    walk(val, best);
+                }
+            }
+            Value::Array(arr) => {
+                for x in arr {
+                    walk(x, best);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(v, &mut best);
+    best.map(|(_, s)| s)
+}
+
 fn read_api_key() -> Result<String, String> {
     for var in ["XAI_API_KEY", "GROK_API_KEY"] {
         if let Ok(v) = std::env::var(var) {
@@ -69,21 +119,15 @@ fn read_api_key() -> Result<String, String> {
             }
         }
     }
-    let path = paths::grok_home().join("auth.json");
+    let path = paths::grok_auth_json();
     let raw = fs::read_to_string(&path).map_err(|_| {
         "未找到 API 密钥。请设置用户级 XAI_API_KEY，或先完成 grok CLI 登录（~/.grok/auth.json）"
             .to_string()
     })?;
     let v: Value = serde_json::from_str(&raw).map_err(|_| "auth.json 无法解析".to_string())?;
-    for key in ["api_key", "access_token", "token"] {
-        if let Some(s) = v.get(key).and_then(|x| x.as_str()) {
-            let t = s.trim();
-            if !t.is_empty() {
-                return Ok(t.to_string());
-            }
-        }
-    }
-    Err("auth.json 中未找到可用 token。请设置 XAI_API_KEY 或重新登录 grok CLI".into())
+    extract_api_key_from_auth(&v).ok_or_else(|| {
+        "auth.json 中未找到可用 token。请设置 XAI_API_KEY 或重新登录 grok CLI".into()
+    })
 }
 
 fn resolve_model(prefs_model: &str) -> String {
@@ -223,5 +267,29 @@ mod tests {
     #[test]
     fn keeps_plain() {
         assert_eq!(sanitize_polished("  修好登录  "), "修好登录");
+    }
+
+    #[test]
+    fn extracts_nested_oidc_key() {
+        let v = serde_json::json!({
+            "https://auth.x.ai::abc": {
+                "key": "eyJhbGciOi.test-jwt-token-value",
+                "refresh_token": "should-not-pick",
+                "auth_mode": "oidc"
+            }
+        });
+        assert_eq!(
+            extract_api_key_from_auth(&v).as_deref(),
+            Some("eyJhbGciOi.test-jwt-token-value")
+        );
+    }
+
+    #[test]
+    fn prefers_xai_api_key_over_nested_jwt() {
+        let v = serde_json::json!({
+            "api_key": "xai-abc12345",
+            "https://auth.x.ai::abc": { "key": "eyJhbGciOi.nested" }
+        });
+        assert_eq!(extract_api_key_from_auth(&v).as_deref(), Some("xai-abc12345"));
     }
 }

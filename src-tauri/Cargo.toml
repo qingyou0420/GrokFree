@@ -1,6 +1,6 @@
 [package]
 name = "grokfree"
-version = "0.9.4"
+version = "0.9.5"
 description = "GrokFree — multi-agent command center over ACP"
 authors = ["GrokFree"]
 edition = "2021"

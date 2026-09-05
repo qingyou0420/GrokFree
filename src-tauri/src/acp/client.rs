@@ -16,8 +16,6 @@ type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>>;
 /// from the current client of a session or a stale one that was replaced.
 static INSTANCE_SEQ: AtomicU64 = AtomicU64::new(1);
 
-/// Default request budget (prompt turns can legitimately run for minutes).
-const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 600;
 /// Handshake / session bootstrap budgets: fail fast so a wedged CLI cannot
 /// hold the spawn path (and the UI) hostage for 10 minutes per request.
 const INIT_TIMEOUT_SECS: u64 = 30;
@@ -278,7 +276,9 @@ impl AcpClient {
     }
 
     pub async fn prompt(&self, session_id: &str, text: &str) -> Result<Value> {
-        self.request(
+        // 不设墙钟超时：一轮写代码/跑测试经常超过 10 分钟。
+        // 挂死由静默看门狗提示「继续等待 / 结束本轮」；进程退出会 fail_all_pending。
+        self.request_until_done(
             "session/prompt",
             json!({
                 "sessionId": session_id,
@@ -326,13 +326,29 @@ impl AcpClient {
         self.write_json(&msg).await
     }
 
-    pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
-        self.request_with_timeout(
-            method,
-            params,
-            std::time::Duration::from_secs(DEFAULT_REQUEST_TIMEOUT_SECS),
-        )
-        .await
+    /// Wait until JSON-RPC result, cancel/kill (`fail_all_pending`), or process exit.
+    async fn request_until_done(&self, method: &str, params: Value) -> Result<Value> {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut map = self.pending.lock().await;
+            map.insert(id, tx);
+        }
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params
+        });
+        if let Err(e) = self.write_json(&msg).await {
+            let mut map = self.pending.lock().await;
+            map.remove(&id);
+            return Err(e);
+        }
+        match rx.await {
+            Ok(res) => res,
+            Err(_) => Err(anyhow!("请求通道已关闭：{method}")),
+        }
     }
 
     pub async fn request_with_timeout(

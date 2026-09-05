@@ -58,7 +58,7 @@ import {
   type ConfirmState,
 } from "./state";
 
-const APP_VERSION = "0.9.5";
+const APP_VERSION = "0.9.6";
 
 const defaultPrefs: DesktopPrefs = {
   grokPath: "",

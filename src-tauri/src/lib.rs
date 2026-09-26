@@ -4,6 +4,7 @@ mod cli_caps;
 mod cloud_update;
 mod commands;
 mod config;
+mod control;
 mod diagnostics;
 mod diff_ops;
 mod git_ops;
@@ -110,6 +111,17 @@ pub fn run() {
                 app.handle().clone(),
                 app.state::<AppState>().supervisor.clone(),
             );
+
+            // 本地控制口：外部程序（助手/脚本）可直接建会话、发 prompt、取消，
+            // 不必去驱动 WebView 界面。只绑 127.0.0.1，需 token。
+            {
+                let st = app.state::<AppState>();
+                control::spawn(
+                    app.handle().clone(),
+                    st.desktop.clone(),
+                    st.supervisor.clone(),
+                );
+            }
 
             // System tray
             let show_i = MenuItem::with_id(app, "show", "显示主窗口", true, None::<&str>)?;
@@ -224,13 +236,100 @@ pub fn run() {
         });
 }
 
+/// 控制台窗口已在整个应用里隐藏（见 main.rs），tracing 输出改写到文件。
+/// 零依赖实现：一个把 Write 转发到 File 的 MakeWriter。
+struct FileWriter(Arc<StdMutex<std::fs::File>>);
+
+impl std::io::Write for FileWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut f = self.0.lock();
+        // 进程一直开着时，启动滚动覆盖不到。超限就截断当前文件，避免无限长大。
+        if f.metadata().map(|m| m.len()).unwrap_or(0) >= LOG_MAX_BYTES {
+            f.set_len(0)?;
+            let _ = f.write_all(b"--- log truncated ---\n");
+        }
+        f.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.lock().flush()
+    }
+}
+
+#[derive(Clone)]
+struct FileMakeWriter(Arc<StdMutex<std::fs::File>>);
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for FileMakeWriter {
+    type Writer = FileWriter;
+    fn make_writer(&'a self) -> Self::Writer {
+        FileWriter(self.0.clone())
+    }
+}
+
+const LOG_MAX_BYTES: u64 = 2 * 1024 * 1024;
+
+/// 启动时若日志已超过上限，把当前文件留成 grokfree.log.1，再开一份新的。
+fn rotate_log_if_needed(path: &std::path::Path, max_bytes: u64) {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    if meta.len() <= max_bytes {
+        return;
+    }
+    let rotated = path.with_file_name("grokfree.log.1");
+    let _ = std::fs::remove_file(&rotated);
+    let _ = std::fs::rename(path, &rotated);
+}
+
 fn init_logging() {
     let log_dir = paths::desktop_logs_dir();
     let _ = std::fs::create_dir_all(&log_dir);
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .compact()
-        .init();
+
+    let log_path = log_dir.join("grokfree.log");
+    rotate_log_if_needed(&log_path, LOG_MAX_BYTES);
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        Ok(f) => {
+            let writer = FileMakeWriter(Arc::new(StdMutex::new(f)));
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_target(false)
+                .compact()
+                .with_writer(writer)
+                .init();
+        }
+        Err(_) => {
+            // 打不开日志文件就退回默认（无控制台时等于静默），不影响主程序。
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_target(false)
+                .compact()
+                .init();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rotate_log_if_needed;
+
+    #[test]
+    fn rotates_oversized_log_and_keeps_the_previous_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "grokfree-log-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("grokfree.log");
+        std::fs::write(&path, b"0123456789").unwrap();
+        rotate_log_if_needed(&path, 4);
+        let rotated = dir.join("grokfree.log.1");
+        assert_eq!(std::fs::read(&rotated).unwrap(), b"0123456789");
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

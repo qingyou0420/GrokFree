@@ -1,5 +1,6 @@
-// Prevents additional console window on Windows in release
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+// Hide the console window in ALL builds (debug included).
+// Logs go to <desktop_logs_dir>/grokfree.log instead of stdout — see init_logging().
+#![windows_subsystem = "windows"]
 
 fn main() {
     grokfree_lib::run();

@@ -7,7 +7,8 @@ export function DiskHistoryModal(props: {
   filterByProject: boolean;
   onFilterByProjectChange: (v: boolean) => void;
   canFilterProject: boolean;
-  busy: boolean;
+  /** 正在从磁盘恢复的 grok 会话 id */
+  resumingDiskIds: string[];
   onResume: (d: DiskSession) => void;
   onDelete: (d: DiskSession) => void;
   onClose: () => void;
@@ -18,7 +19,7 @@ export function DiskHistoryModal(props: {
     filterByProject,
     onFilterByProjectChange,
     canFilterProject,
-    busy,
+    resumingDiskIds,
     onResume,
     onDelete,
     onClose,
@@ -82,7 +83,7 @@ export function DiskHistoryModal(props: {
                   <button
                     type="button"
                     className="disk-session-item"
-                    disabled={busy}
+                    disabled={resumingDiskIds.includes(d.id)}
                     onClick={() => onResume(d)}
                   >
                     <strong>{d.title}</strong>
@@ -97,7 +98,7 @@ export function DiskHistoryModal(props: {
                     type="button"
                     className="btn sm danger"
                     title="从磁盘永久删除"
-                    disabled={busy}
+                    disabled={resumingDiskIds.includes(d.id)}
                     onClick={() => onDelete(d)}
                   >
                     删除

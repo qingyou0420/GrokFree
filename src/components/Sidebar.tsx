@@ -91,7 +91,10 @@ export type SidebarProps = {
   fromLive: LiveSession[];
   fromMeta: SessionMeta[];
   activeSessionId: string | null;
-  busy: boolean;
+  /** 当前项目正在新建会话 */
+  projectStarting: boolean;
+  /** 正在恢复的桌面会话 id */
+  resumingSessionIds: string[];
   /** 可选智能体档案（新建会话用）与当前选中 */
   enabledAgents: AgentProfile[];
   selectedAgentId: string;
@@ -131,7 +134,8 @@ export function Sidebar({
   fromLive,
   fromMeta,
   activeSessionId,
-  busy,
+  projectStarting,
+  resumingSessionIds,
   enabledAgents,
   selectedAgentId,
   onSelectAgent,
@@ -319,7 +323,9 @@ export function Sidebar({
             type="button"
             className="btn primary split-main"
             title="在当前项目新建会话 (Ctrl+N)"
-            disabled={!projects.find((p) => p.id === activeProjectId) || busy}
+            disabled={
+              !projects.find((p) => p.id === activeProjectId) || projectStarting
+            }
             onClick={() => void onCreateSession()}
           >
             <IconPlus size={13} /> 新建
@@ -472,12 +478,16 @@ export function Sidebar({
                 <button
                   type="button"
                   className="session-item-body"
-                  disabled={busy}
+                  disabled={resumingSessionIds.includes(s.id)}
                   onClick={() => void onResumeMeta(s)}
                   onDoubleClick={() =>
                     setRenaming({ id: s.id, title: s.title })
                   }
-                  title={busy ? "正在恢复…" : "点击恢复 · 双击重命名"}
+                  title={
+                    resumingSessionIds.includes(s.id)
+                      ? "正在恢复…"
+                      : "点击恢复 · 双击重命名"
+                  }
                 >
                   <span className="name">
                     <span

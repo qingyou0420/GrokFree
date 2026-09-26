@@ -47,7 +47,8 @@ export function useSessionActions(opts: {
   activeProject: Project | null;
   setState: Dispatch<SetStateAction<DesktopState | null>>;
   prefsRef: MutableRefObject<DesktopPrefs>;
-  setBusy: Dispatch<SetStateAction<boolean>>;
+  /** 该项目正在 createSession。结束时传 false。 */
+  markProjectStarting: (projectId: string, starting: boolean) => void;
   /** 遮罩揭开（loadTranscript / createSession 之后） */
   revealChatAfterPaint: RevealChat;
   /** 新会话强制贴底（createSession 之前） */
@@ -65,7 +66,7 @@ export function useSessionActions(opts: {
     activeProject,
     setState,
     prefsRef,
-    setBusy,
+    markProjectStarting,
     revealChatAfterPaint,
     beginAtBottom,
     askConfirm,
@@ -142,7 +143,7 @@ export function useSessionActions(opts: {
         }
       }
       createInFlightRef.current.add(proj.id);
-      setBusy(true);
+      markProjectStarting(proj.id, true);
       setShowDashboard(false);
       beginAtBottom();
       try {
@@ -176,13 +177,13 @@ export function useSessionActions(opts: {
         flash(`启动失败：${msg}`, "error");
       } finally {
         createInFlightRef.current.delete(proj.id);
-        setBusy(false);
+        markProjectStarting(proj.id, false);
       }
     },
     [
       activeProject,
       env,
-      setBusy,
+      markProjectStarting,
       setShowDashboard,
       beginAtBottom,
       setLive,

@@ -17,6 +17,8 @@ export type DesktopPrefs = {
   historyInitialVisible?: number;
   /** 会话切换遮罩不显示文字（仅挡闪） */
   chatMaskQuiet?: boolean;
+  /** 进程意外退出后自动恢复并继续。缺省视为开。 */
+  autoContinue?: boolean;
 };
 
 export type Project = {
@@ -62,6 +64,8 @@ export type LiveSession = {
   error?: string | null;
   delegatedBy?: string | null;
   jobId?: string | null;
+  /** 本次退出会自动续跑；为真时不要清掉发送队列 */
+  autoContinuePending?: boolean;
 };
 
 /** 小精灵档案：如何启动一个说 ACP 的进程（agents.json） */

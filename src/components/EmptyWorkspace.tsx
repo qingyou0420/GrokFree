@@ -3,13 +3,18 @@ import type { Project } from "../lib/types";
 /** 无活跃会话时的空态引导 */
 export function EmptyWorkspace(props: {
   activeProject: Project | null;
-  busy: boolean;
+  projectStarting: boolean;
   onCreateSession: () => void;
   onLoadDiskHistory: () => void;
   onShowDashboard: () => void;
 }) {
-  const { activeProject, busy, onCreateSession, onLoadDiskHistory, onShowDashboard } =
-    props;
+  const {
+    activeProject,
+    projectStarting,
+    onCreateSession,
+    onLoadDiskHistory,
+    onShowDashboard,
+  } = props;
   return (
     <div className="empty-workspace">
       <div className="empty-illustration" aria-hidden>
@@ -25,7 +30,7 @@ export function EmptyWorkspace(props: {
         <button
           type="button"
           className="btn primary"
-          disabled={!activeProject || busy}
+          disabled={!activeProject || projectStarting}
           onClick={onCreateSession}
         >
           新建会话

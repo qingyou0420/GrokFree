@@ -25,8 +25,6 @@ type LoadTranscript = (
  * Resume sidebar meta / disk history sessions with in-flight guard.
  */
 export function useResumeSession(opts: {
-  busy: boolean;
-  setBusy: (v: boolean) => void;
   projects: Project[];
   activeProject: Project | null;
   setLive: (
@@ -47,10 +45,25 @@ export function useResumeSession(opts: {
 }) {
   const ownInFlight = useRef(false);
   const inFlight = opts.inFlightRef ?? ownInFlight;
-  /** 在途恢复（App 用它渲染「取消恢复」按钮，cancel_start 杀在途进程） */
-  const [resuming, setResuming] = useState<{ id: string; title: string } | null>(
-    null
-  );
+  /** 正在恢复的桌面会话。其他会话不受影响。 */
+  const inflightIds = useRef(new Set<string>());
+  const inflightDiskIds = useRef(new Set<string>());
+  const [resumingList, setResumingList] = useState<
+    { id: string; title: string; diskId?: string }[]
+  >([]);
+
+  const beginResume = (item: { id: string; title: string; diskId?: string }) => {
+    inflightIds.current.add(item.id);
+    if (item.diskId) inflightDiskIds.current.add(item.diskId);
+    inFlight.current = true;
+    setResumingList((prev) => [...prev.filter((x) => x.id !== item.id), item]);
+  };
+  const endResume = (id: string, diskId?: string) => {
+    inflightIds.current.delete(id);
+    if (diskId) inflightDiskIds.current.delete(diskId);
+    inFlight.current = inflightIds.current.size > 0;
+    setResumingList((prev) => prev.filter((x) => x.id !== id));
+  };
 
   const resumeMeta = useCallback(
     async (meta: {
@@ -65,15 +78,13 @@ export function useResumeSession(opts: {
         opts.flash("没有可恢复的会话 ID", "error");
         return;
       }
-      if (opts.busy || inFlight.current) {
-        opts.flash("正在恢复会话，请稍候…", "info");
+      if (inflightIds.current.has(meta.id)) {
+        opts.flash("该会话正在恢复，请稍候…", "info");
         return;
       }
-      inFlight.current = true;
+      beginResume({ id: meta.id, title: meta.title });
       opts.onBeforeResume?.();
-      opts.setBusy(true);
       opts.setShowDashboard(false);
-      setResuming({ id: meta.id, title: meta.title });
       try {
         let pathHint: string | null = null;
         try {
@@ -108,19 +119,17 @@ export function useResumeSession(opts: {
         opts.flash(`恢复失败：${e}`, "error");
         opts.onResumeError?.();
       } finally {
-        inFlight.current = false;
-        opts.setBusy(false);
-        setResuming(null);
+        endResume(meta.id);
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional opts bag
-    [opts.busy, opts.projects, opts.activeProject, opts.loadTranscriptForSession, inFlight]
+    [opts.projects, opts.activeProject, opts.loadTranscriptForSession, inFlight]
   );
 
   const resumeDiskSession = useCallback(
     async (d: DiskSession) => {
-      if (opts.busy || inFlight.current) {
-        opts.flash("正在恢复会话，请稍候…", "info");
+      if (inflightDiskIds.current.has(d.id)) {
+        opts.flash("该会话正在恢复，请稍候…", "info");
         return;
       }
       const project =
@@ -143,12 +152,14 @@ export function useResumeSession(opts: {
       }
       const cwdUse = d.cwd || project.cwd;
       const desktopSessionId = uid("desk");
-      inFlight.current = true;
+      beginResume({
+        id: desktopSessionId,
+        title: d.title || d.id,
+        diskId: d.id,
+      });
       opts.onBeforeResume?.();
-      opts.setBusy(true);
       opts.setShowDiskHistory(false);
       opts.setShowDashboard(false);
-      setResuming({ id: desktopSessionId, title: d.title || d.id });
       try {
         // 磁盘历史即 ~/.grok/sessions，只有 grok 档案能恢复
         const session = await api.resumeSession({
@@ -179,14 +190,21 @@ export function useResumeSession(opts: {
         opts.flash(`磁盘会话恢复失败：${e}`, "error");
         opts.onResumeError?.();
       } finally {
-        inFlight.current = false;
-        opts.setBusy(false);
-        setResuming(null);
+        endResume(desktopSessionId, d.id);
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [opts.busy, opts.projects, opts.activeProject, opts.loadTranscriptForSession, inFlight]
+    [opts.projects, opts.activeProject, opts.loadTranscriptForSession, inFlight]
   );
 
-  return { resumeMeta, resumeDiskSession, resumeInFlightRef: inFlight, resuming };
+  return {
+    resumeMeta,
+    resumeDiskSession,
+    resumeInFlightRef: inFlight,
+    resuming: resumingList[resumingList.length - 1] ?? null,
+    resumingSessionIds: resumingList.map((x) => x.id),
+    resumingDiskIds: resumingList
+      .map((x) => x.diskId)
+      .filter((x): x is string => !!x),
+  };
 }

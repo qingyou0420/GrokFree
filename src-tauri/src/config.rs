@@ -31,6 +31,13 @@ pub struct DesktopPrefs {
     /// Hide “整理对话…” text on session paint mask (spinner/blank only).
     #[serde(default)]
     pub chat_mask_quiet: bool,
+    /// 进程意外退出且本轮未完成时，自动恢复并补发「继续」。默认开。
+    #[serde(default = "default_auto_continue")]
+    pub auto_continue: bool,
+}
+
+fn default_auto_continue() -> bool {
+    true
 }
 
 fn default_fs_scope() -> String {
@@ -63,6 +70,7 @@ impl DesktopPrefs {
             fs_scope: default_fs_scope(),
             history_initial_visible: default_history_initial(),
             chat_mask_quiet: false,
+            auto_continue: true,
         }
     }
 }

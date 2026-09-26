@@ -16,7 +16,7 @@ type Flash = (
   kind?: "info" | "success" | "error",
   sessionId?: string | null
 ) => void;
-type SetPermission = (p: PermissionReq | null) => void;
+type SetPermission = Dispatch<SetStateAction<PermissionReq | null>>;
 
 function uid(p: string) {
   return `${p}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
@@ -175,7 +175,54 @@ export function useAgentEvents(opts: {
               "error",
               p.sessionId
             );
+            const dropped = useSessionStore.getState().clearSendQueue(p.sessionId);
+            if (dropped.length > 0) {
+              flash(
+                `自动恢复失败，已丢弃 ${dropped.length} 条排队消息`,
+                "error",
+                p.sessionId
+              );
+            }
           }
+        })
+      );
+      unsubs.push(
+        await api.on<{ sessionId: string; text: string }>("agent://userPrompt", (p) => {
+          if (!p.sessionId || !p.text) return;
+          setTranscripts((prev) => ({
+            ...prev,
+            [p.sessionId]: [
+              ...(prev[p.sessionId] ?? []),
+              { kind: "user", id: uid("u"), text: p.text },
+            ],
+          }));
+        })
+      );
+      unsubs.push(
+        await api.on<{ sessionId: string; error?: string }>(
+          "agent://userPromptFailed",
+          (p) => {
+            if (!p.sessionId) return;
+            setTranscripts((prev) => ({
+              ...prev,
+              [p.sessionId]: [
+                ...(prev[p.sessionId] ?? []),
+                {
+                  kind: "system",
+                  id: uid("sys"),
+                  text: `发送失败：${p.error || "未知错误"}`,
+                },
+              ],
+            }));
+            flash(`发送失败：${p.error || "未知错误"}`, "error", p.sessionId);
+          }
+        )
+      );
+      unsubs.push(
+        await api.on<{ sessionId: string }>("agent://permissionResolved", (p) => {
+          setPermission((cur) =>
+            cur && cur.sessionId === p.sessionId ? null : cur
+          );
         })
       );
       unsubs.push(
@@ -262,13 +309,17 @@ export function useAgentEvents(opts: {
         }
       }
       if (s.status === "error" && prev !== "error") {
-        flash(s.error || `会话出错：${s.title}`, "error", s.id);
-        // 会话出错：丢弃排队消息并告知（不要静默吞掉）
         const store = useSessionStore.getState();
         store.clearStall(s.id);
-        const dropped = store.clearSendQueue(s.id);
-        if (dropped.length > 0) {
-          flash(`会话出错，已丢弃 ${dropped.length} 条排队消息`, "error", s.id);
+        if (s.autoContinuePending) {
+          // 队列留到续跑结束（回到 idle）再接力。续跑失败由 autoContinue 事件丢弃。
+          flash("进程退出，正在自动恢复…", "info", s.id);
+        } else {
+          flash(s.error || `会话出错：${s.title}`, "error", s.id);
+          const dropped = store.clearSendQueue(s.id);
+          if (dropped.length > 0) {
+            flash(`会话出错，已丢弃 ${dropped.length} 条排队消息`, "error", s.id);
+          }
         }
       }
       prevStatus.current[s.id] = s.status;

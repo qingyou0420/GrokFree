@@ -22,7 +22,10 @@ export function Topbar(props: {
   createAgentLabel?: string | null;
   pendingDiffCount: number;
   showReview: boolean;
-  busy: boolean;
+  /** 当前项目正在新建会话 */
+  projectStarting: boolean;
+  /** 当前会话正在恢复 */
+  sessionResuming: boolean;
   topMenuOpen: boolean;
   setTopMenuOpen: (v: boolean | ((b: boolean) => boolean)) => void;
   setProjectMenuId: (id: string | null) => void;
@@ -48,7 +51,8 @@ export function Topbar(props: {
     createAgentLabel,
     pendingDiffCount,
     showReview,
-    busy,
+    projectStarting,
+    sessionResuming,
     topMenuOpen,
     setTopMenuOpen,
     setProjectMenuId,
@@ -111,10 +115,12 @@ export function Topbar(props: {
           <button
             type="button"
             className="btn sm primary"
-            disabled={!activeProject || busy}
+            disabled={!activeProject || projectStarting}
             onClick={onCreateSession}
           >
-            {busy ? "启动中…" : `新建${createAgentLabel ? ` · ${createAgentLabel}` : ""}`}
+            {projectStarting
+              ? "启动中…"
+              : `新建${createAgentLabel ? ` · ${createAgentLabel}` : ""}`}
           </button>
           <div className="menu-shell">
             <button
@@ -173,7 +179,7 @@ export function Topbar(props: {
           <button
             type="button"
             className="btn sm"
-            disabled={busy}
+            disabled={projectStarting || sessionResuming}
             onClick={onRestartSession}
           >
             重启会话

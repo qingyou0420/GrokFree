@@ -34,6 +34,16 @@ pub struct LiveSession {
     pub delegated_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job_id: Option<String>,
+    /// 本次退出会自动续跑。始终下发，避免前端合并快照时把上一次的 true 留住。
+    #[serde(default)]
+    pub auto_continue_pending: bool,
+}
+
+#[derive(Clone)]
+struct PendingPermission {
+    request_id: Value,
+    scope_key: String,
+    allow_option: String,
 }
 
 struct SessionRuntime {
@@ -54,6 +64,8 @@ struct SessionRuntime {
     stall_notified: bool,
     /// 「本会话内允许」的权限范围缓存（scope key，见 permission_scope_key）。
     allow_scopes: std::collections::HashSet<String>,
+    /// 当前未应答的权限请求。控制口与弹窗共用这一份。
+    pending_permission: Option<PendingPermission>,
 }
 
 impl SessionRuntime {
@@ -70,9 +82,12 @@ impl SessionRuntime {
             turn_had_activity: false,
             stall_notified: false,
             allow_scopes: std::collections::HashSet::new(),
+            pending_permission: None,
         }
     }
 }
+
+mod auto_continue;
 
 /// 借鉴 grok-app 的进程治理默认值（process_limits）：
 /// 活跃 agent 进程上限；超限时先回收最旧的空闲会话，全忙则拒绝新建。
@@ -83,11 +98,6 @@ const IDLE_HIBERNATE_SECS: u64 = 30 * 60;
 const STALL_SILENCE_SECS: u64 = 300;
 /// 本轮从未产生 token/工具事件时的静默阈值（挂死的 prompt 应更早提示）。
 const STALL_SILENCE_NO_OUTPUT_SECS: u64 = 120;
-/// 进程意外退出后自动恢复并补发「继续」的次数上限（防崩溃死循环）。
-const MAX_AUTO_CONTINUES: u8 = 2;
-const AUTO_CONTINUE_PROMPT: &str =
-    "继续。上一轮因超时或进程退出中断。请从中断处接着完成，不要重复已经做过的修改。";
-
 pub struct Supervisor {
     sessions: Mutex<HashMap<String, SessionRuntime>>,
     state: Arc<StdMutex<DesktopState>>,
@@ -240,6 +250,7 @@ impl Supervisor {
             error: None,
             delegated_by: delegated_by.clone(),
             job_id: job_id.clone(),
+            auto_continue_pending: false,
         };
 
         {
@@ -354,6 +365,7 @@ impl Supervisor {
             error: None,
             delegated_by: kept_delegated.clone(),
             job_id: kept_job.clone(),
+            auto_continue_pending: false,
         };
 
         {
@@ -721,7 +733,13 @@ impl Supervisor {
                     rt.allow_scopes.insert(scope);
                 }
             }
+            rt.pending_permission = None;
+            rt.meta.auto_continue_pending = false;
             let _ = app.emit("agent://state", &rt.meta);
+            let _ = app.emit(
+                "agent://permissionResolved",
+                json!({ "sessionId": session_id }),
+            );
         }
         Ok(())
     }
@@ -1196,6 +1214,8 @@ impl Supervisor {
         code: Option<i32>,
         client_instance: u64,
     ) {
+        // 先读偏好和次数，避免在 sessions 锁内再借 self。
+        let allowed = self.auto_continue_allowed(session_id);
         let mut snapshot: Option<LiveSession> = None;
         {
             let mut map = self.sessions.lock().await;
@@ -1209,11 +1229,14 @@ impl Supervisor {
                 let killed = rt.client.as_ref().map(|c| c.is_killed()).unwrap_or(false);
                 let inflight = rt.prompt_inflight;
                 rt.client = None;
+                rt.pending_permission = None;
                 rt.meta.status = fsm::transition(&rt.meta.status, FsmEvent::AgentExited).into();
                 rt.meta.error = Some(format!("Agent 进程已退出：{code:?}"));
                 rt.prompt_inflight = false;
+                let will = inflight && !killed && rt.meta.grok_session_id.is_some() && allowed;
+                rt.meta.auto_continue_pending = will;
                 let _ = app.emit("agent://state", &rt.meta);
-                if inflight && !killed && rt.meta.grok_session_id.is_some() {
+                if will {
                     snapshot = Some(rt.meta.clone());
                 }
             }
@@ -1223,79 +1246,62 @@ impl Supervisor {
         }
     }
 
-    fn schedule_auto_continue(&self, app: AppHandle, meta: LiveSession) {
-        let n = {
-            let mut map = self.auto_continues.lock();
-            let e = map.entry(meta.id.clone()).or_insert(0);
-            if *e >= MAX_AUTO_CONTINUES {
-                tracing::warn!(
-                    "会话 {} 自动续跑已达 {MAX_AUTO_CONTINUES} 次，不再重试",
-                    meta.id
-                );
-                return;
-            }
-            *e += 1;
-            *e
+    /// 控制口 / 前端在派发前看一眼：忙则不能再发一轮。
+    pub async fn turn_conflict(&self, session_id: &str) -> Option<&'static str> {
+        let map = self.sessions.lock().await;
+        let Some(rt) = map.get(session_id) else {
+            return Some("会话不存在或已休眠");
         };
-        tracing::info!("会话 {} 进程意外退出，将自动恢复并继续（第 {n} 次）", meta.id);
-        tauri::async_runtime::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
-            let Some(state) = app.try_state::<crate::commands::AppState>() else {
-                return;
-            };
-            let Some(gsid) = meta.grok_session_id.clone() else {
-                return;
-            };
-            if let Err(e) = state
-                .supervisor
-                .resume_session(
-                    app.clone(),
-                    meta.id.clone(),
-                    gsid,
-                    meta.project_id.clone(),
-                    meta.cwd.clone(),
-                    meta.title.clone(),
-                    Some(meta.agent_id.clone()),
-                )
-                .await
-            {
-                tracing::warn!("自动恢复会话 {} 失败：{e}", meta.id);
-                let _ = app.emit(
-                    "agent://autoContinue",
-                    json!({
-                        "sessionId": meta.id,
-                        "ok": false,
-                        "error": e.to_string(),
-                    }),
-                );
-                return;
-            }
-            if let Err(e) = state
-                .supervisor
-                .send_prompt(app.clone(), &meta.id, AUTO_CONTINUE_PROMPT)
-                .await
-            {
-                tracing::warn!("自动继续发送失败（{}）：{e}", meta.id);
-                let _ = app.emit(
-                    "agent://autoContinue",
-                    json!({
-                        "sessionId": meta.id,
-                        "ok": false,
-                        "error": e.to_string(),
-                    }),
-                );
-                return;
-            }
-            let _ = app.emit(
-                "agent://autoContinue",
-                json!({
-                    "sessionId": meta.id,
-                    "ok": true,
-                    "text": AUTO_CONTINUE_PROMPT,
-                    "attempt": n,
-                }),
-            );
-        });
+        if matches!(
+            rt.meta.status.as_str(),
+            fsm::status::RUNNING | fsm::status::WAITING_PERMISSION | "starting"
+        ) {
+            return Some("会话正在执行中");
+        }
+        if rt.client.is_none() {
+            return Some("会话没有运行中的 Agent");
+        }
+        None
+    }
+
+    pub async fn permission_pending(&self, session_id: &str) -> Option<(String, String)> {
+        let map = self.sessions.lock().await;
+        map.get(session_id).and_then(|rt| {
+            rt.pending_permission
+                .as_ref()
+                .map(|p| (p.scope_key.clone(), p.allow_option.clone()))
+        })
+    }
+
+    /// 应答控制口看到的那条待授权。没有挂起请求则失败，不猜 request id。
+    pub async fn respond_pending_permission(
+        &self,
+        app: AppHandle,
+        session_id: &str,
+        allow: bool,
+        remember: bool,
+    ) -> Result<()> {
+        let pending = {
+            let map = self.sessions.lock().await;
+            map.get(session_id)
+                .and_then(|rt| rt.pending_permission.clone())
+        };
+        let Some(p) = pending else {
+            return Err(anyhow!("没有待处理的授权"));
+        };
+        self.respond_permission(
+            app,
+            session_id,
+            p.request_id,
+            allow,
+            if allow { Some(p.allow_option) } else { None },
+            if allow && remember {
+                Some(p.scope_key)
+            } else {
+                None
+            },
+        )
+        .await
     }
 
     pub async fn set_status(&self, app: &AppHandle, session_id: &str, status: &str) {
@@ -1306,13 +1312,24 @@ impl Supervisor {
         }
     }
 
-    /// 收到 `session/request_permission`：状态机进入 waiting_permission。
-    pub async fn mark_waiting_permission(&self, app: &AppHandle, session_id: &str) {
+    /// 收到 `session/request_permission`：状态机进入 waiting_permission，并记下请求供控制口应答。
+    pub async fn mark_waiting_permission(
+        &self,
+        app: &AppHandle,
+        session_id: &str,
+        request_id: Value,
+        params: &Value,
+    ) {
         let mut map = self.sessions.lock().await;
         if let Some(rt) = map.get_mut(session_id) {
             rt.meta.status =
                 fsm::transition(&rt.meta.status, FsmEvent::PermissionRequest).into();
             rt.last_activity = std::time::Instant::now();
+            rt.pending_permission = Some(PendingPermission {
+                request_id,
+                scope_key: permission_scope_key(params),
+                allow_option: pick_allow_option(params),
+            });
             let _ = app.emit("agent://state", &rt.meta);
         }
     }
@@ -1448,6 +1465,18 @@ async fn handle_immediate_event(
                         return;
                     }
                 }
+                let scope_key = permission_scope_key(&params);
+                if let Some(state) = app.try_state::<crate::commands::AppState>() {
+                    state
+                        .supervisor
+                        .mark_waiting_permission(
+                            app,
+                            desktop_session_id,
+                            id.clone(),
+                            &params,
+                        )
+                        .await;
+                }
                 let _ = app.emit(
                     "agent://permission",
                     json!({
@@ -1456,17 +1485,9 @@ async fn handle_immediate_event(
                         "method": method,
                         "params": params,
                         // 供前端「本会话内允许」回传（respond_permission.rememberScope）
-                        "scopeKey": permission_scope_key(&params)
+                        "scopeKey": scope_key
                     }),
                 );
-                // Rust 侧也进入 waiting_permission：状态机真值在宿主，
-                // 前端只投影快照（此前仅发事件，后端 meta 一直停在 running）
-                if let Some(state) = app.try_state::<crate::commands::AppState>() {
-                    state
-                        .supervisor
-                        .mark_waiting_permission(app, desktop_session_id)
-                        .await;
-                }
                 return;
             }
 
@@ -1697,6 +1718,21 @@ mod tests {
             ]
         });
         assert_eq!(pick_allow_option(&p), "proceed_once");
+    }
+
+    #[test]
+    fn auto_continue_off_or_capped() {
+        let st = Arc::new(StdMutex::new(crate::config::DesktopState {
+            prefs: crate::config::DesktopPrefs::defaults(),
+            ..Default::default()
+        }));
+        let sup = Supervisor::new(st.clone());
+        assert!(sup.auto_continue_allowed("s1"));
+        st.lock().prefs.auto_continue = false;
+        assert!(!sup.auto_continue_allowed("s1"));
+        st.lock().prefs.auto_continue = true;
+        sup.auto_continues.lock().insert("s1".into(), 2);
+        assert!(!sup.auto_continue_allowed("s1"));
     }
 
     #[test]

@@ -58,7 +58,7 @@ import {
   type ConfirmState,
 } from "./state";
 
-const APP_VERSION = "0.9.6";
+const APP_VERSION = "0.9.7";
 
 const defaultPrefs: DesktopPrefs = {
   grokPath: "",
@@ -74,6 +74,7 @@ const defaultPrefs: DesktopPrefs = {
   fsScope: "workspace",
   historyInitialVisible: HISTORY_INITIAL_DEFAULT,
   chatMaskQuiet: false,
+  autoContinue: true,
 };
 
 /** 空数组常量：选择器稳定返回同一引用，避免无关会话流式更新触发重渲染 */
@@ -133,7 +134,8 @@ export default function App() {
   // —— 本地状态
   const [state, setState] = useState<DesktopState | null>(null);
   const [env, setEnv] = useState<GrokEnvironment | null>(null);
-  const [busy, setBusy] = useState(false);
+  /** 正在新建会话的项目 id。只锁该项目的「新建」，不锁其他项目或其他会话。 */
+  const [startingProjects, setStartingProjects] = useState<string[]>([]);
   const [planDismissed, setPlanDismissed] = useState<Record<string, boolean>>(
     {}
   );
@@ -322,6 +324,18 @@ export default function App() {
     (c: ConfirmState) => setConfirm(c),
     [setConfirm]
   );
+  const markProjectStarting = useCallback((id: string, starting: boolean) => {
+    setStartingProjects((prev) =>
+      starting
+        ? prev.includes(id)
+          ? prev
+          : [...prev, id]
+        : prev.filter((x) => x !== id)
+    );
+  }, []);
+  const projectStarting =
+    !!activeProjectId && startingProjects.includes(activeProjectId);
+
   const {
     addProject,
     createSession,
@@ -348,7 +362,7 @@ export default function App() {
     activeProject,
     setState,
     prefsRef,
-    setBusy,
+    markProjectStarting,
     revealChatAfterPaint,
     beginAtBottom,
     askConfirm,
@@ -358,9 +372,13 @@ export default function App() {
   });
 
   // —— 恢复会话（依赖 loadTranscriptForSession，必须在 useSessionActions 之后）
-  const { resumeMeta, resumeDiskSession, resuming } = useResumeSession({
-    busy,
-    setBusy,
+  const {
+    resumeMeta,
+    resumeDiskSession,
+    resuming,
+    resumingSessionIds,
+    resumingDiskIds,
+  } = useResumeSession({
     projects,
     activeProject,
     setLive,
@@ -700,7 +718,8 @@ export default function App() {
         fromLive={projectSessions.fromLive}
         fromMeta={projectSessions.fromMeta}
         activeSessionId={activeSessionId}
-        busy={busy}
+        projectStarting={projectStarting}
+        resumingSessionIds={resumingSessionIds}
         enabledAgents={enabledAgents}
         selectedAgentId={selectedAgentId}
         onSelectAgent={setSelectedAgentId}
@@ -734,7 +753,10 @@ export default function App() {
           createAgentLabel={agentName(selectedAgentId)}
           pendingDiffCount={pendingDiffCount}
           showReview={showReview}
-          busy={busy}
+          projectStarting={projectStarting}
+          sessionResuming={
+            !!activeSessionId && resumingSessionIds.includes(activeSessionId)
+          }
           topMenuOpen={topMenuOpen}
           setTopMenuOpen={setTopMenuOpen}
           setProjectMenuId={setProjectMenuId}
@@ -796,7 +818,7 @@ export default function App() {
           ) : !activeSessionId ? (
             <EmptyWorkspace
               activeProject={activeProject}
-              busy={busy}
+              projectStarting={projectStarting}
               onCreateSession={() => void createSession(null, selectedAgentId)}
               onLoadDiskHistory={() => void loadDiskHistory()}
               onShowDashboard={() => setShowDashboard(true)}
@@ -893,7 +915,9 @@ export default function App() {
           agentName={agentName(activeLive?.agentId)}
           input={input}
           setInput={setInput}
-          busy={busy}
+          busy={
+            !!activeSessionId && resumingSessionIds.includes(activeSessionId)
+          }
           turnRunning={
             activeLive?.status === "running" ||
             activeLive?.status === "waiting_permission"
@@ -901,10 +925,8 @@ export default function App() {
           queuedCount={queuedCount}
           statusHint={statusLabel(activeLive?.status)}
           showStop={
-            !!(
-              activeLive &&
-              (activeLive.status === "running" || busy)
-            )
+            activeLive?.status === "running" ||
+            activeLive?.status === "waiting_permission"
           }
           onStop={() => {
             if (!activeLive) return;
@@ -1025,7 +1047,7 @@ export default function App() {
           filterByProject={diskFilterProject}
           onFilterByProjectChange={setDiskFilterProject}
           canFilterProject={!!activeProject}
-          busy={busy}
+          resumingDiskIds={resumingDiskIds}
           onResume={(d) => void resumeDiskSession(d)}
           onDelete={(d) => void deleteDiskSession(d)}
           onClose={() => setShowDiskHistory(false)}
